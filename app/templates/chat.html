@@ -1,0 +1,119 @@
+{% extends "layout.html" %}
+
+{% block content %}
+<main
+  class="app-shell"
+  data-condition="{{ condition }}"
+  data-input-mode="{{ input_mode }}"
+  data-conversation-style="{{ conversation_style }}"
+  data-initial-greeting="{{ initial_question }}"
+>
+  <section class="booking-area" aria-label="Salon booking">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">ZOSS Salon</p>
+        <h1>髮型服務諮詢</h1>
+      </div>
+    </header>
+
+    <section class="hero-band">
+      <div>
+        <p class="eyebrow">Salon Booking</p>
+        <h2>選擇適合你的髮型服務</h2>
+      </div>
+      <p>瀏覽染髮與護髮服務，並透過 ZOBOT 了解方案差異與髮況建議。</p>
+    </section>
+
+    <section class="service-sections" aria-label="Hair services">
+      <section class="service-section" aria-labelledby="color-services-title">
+        <h2 id="color-services-title">染髮服務</h2>
+        <div class="service-grid">
+          <article class="service-card">
+            <div>
+              <h3>日本資生堂染髮</h3>
+              <p>適合想改變髮色、提升整體造型，並重視染後質感的顧客。</p>
+            </div>
+            <button type="button" class="service-send" data-service-choice="日本資生堂染髮">選擇此服務</button>
+          </article>
+          <article class="service-card">
+            <div>
+              <h3>日本哥德式染髮</h3>
+              <p>適合想染髮，同時在意染後髮質與修護感的顧客。</p>
+            </div>
+            <button type="button" class="service-send" data-service-choice="日本哥德式染髮">選擇此服務</button>
+          </article>
+        </div>
+      </section>
+
+      <section class="service-section" aria-labelledby="treatment-services-title">
+        <h2 id="treatment-services-title">護髮服務</h2>
+        <div class="service-grid">
+          <article class="service-card">
+            <div>
+              <h3>哥德式護髮</h3>
+              <p>適合染燙後受損、乾燥或髮尾毛裂，需要深層修護的顧客。</p>
+            </div>
+            <button type="button" class="service-send" data-service-choice="哥德式護髮">選擇此服務</button>
+          </article>
+          <article class="service-card">
+            <div>
+              <h3>資生堂護髮</h3>
+              <p>適合想提升柔順度、光澤與髮絲觸感的顧客。</p>
+            </div>
+            <button type="button" class="service-send" data-service-choice="資生堂護髮">選擇此服務</button>
+          </article>
+        </div>
+      </section>
+    </section>
+  </section>
+
+  <aside class="chat-panel" aria-label="Chatbot panel">
+    <div class="chat-header">
+      <div>
+        <p class="eyebrow">Chatbot</p>
+        <h2>ZOBOT</h2>
+      </div>
+    </div>
+
+    <div id="chat-messages" class="chat-messages" aria-live="polite">
+      <div class="message assistant">
+        {{ initial_question }}
+      </div>
+    </div>
+
+    <section id="recommendation-card" class="recommendation-card" hidden>
+      <p class="eyebrow">ZOBOT 建議</p>
+      <h3>ZOBOT 建議</h3>
+      <h4>參考方案</h4>
+      <p id="recommended-service" class="recommended-service"></p>
+      <h4>原因說明</h4>
+      <p id="recommendation-reason"></p>
+      <h4>下一步提示</h4>
+      <p id="recommendation-next-step" class="recommendation-prompt"></p>
+      <div class="recommendation-actions">
+        <button type="button" id="reset-consultation">重新諮詢</button>
+      </div>
+    </section>
+
+    <section id="completion-card" class="completion-card" hidden>
+      <p class="eyebrow">完成</p>
+      <h3>服務選擇完成</h3>
+      <p>已選擇：<strong id="completed-service"></strong></p>
+      <p>請將此頁面交還研究人員。</p>
+    </section>
+
+    {% if input_mode == "button" %}
+      <div id="button-options" class="button-options">
+        {% for option in initial_buttons %}
+          <button type="button" class="chat-option" data-message="{{ option }}">{{ option }}</button>
+        {% endfor %}
+      </div>
+    {% else %}
+      <form id="chat-form" class="chat-form">
+        <input id="chat-input" type="text" autocomplete="off" placeholder="輸入你的需求，例如：我的頭髮很乾燥">
+        <button type="submit">送出</button>
+      </form>
+    {% endif %}
+  </aside>
+</main>
+{% endblock %}
