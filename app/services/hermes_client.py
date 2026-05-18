@@ -3,6 +3,12 @@ import os
 import urllib.error
 import urllib.request
 
+from app.services.prompt_builder import build_gemini_instruction
+
+
+MAX_BUTTON_OPTIONS = 3
+UNCERTAIN_BUTTON_LABEL = "我不確定"
+
 
 SERVICE_HINTS = {
     "日本哥德式染髮": {
@@ -80,6 +86,7 @@ def _get_mock_reply(input_mode, conversation_style, message, history, system_pro
     if final_output:
         return {
             "reply": "我已根據你的需求整理出一個參考建議，請查看下方摘要。",
+            "source": "mock",
             "is_final": True,
             "final_output": final_output,
         }
@@ -89,20 +96,31 @@ def _get_mock_reply(input_mode, conversation_style, message, history, system_pro
     else:
         reply = _topic_led_reply(message, input_mode, user_turn_count)
 
-    return {"reply": reply, "is_final": False, "final_output": None}
+    return {"reply": reply, "source": "mock", "is_final": False, "final_output": None}
 
 
 def _get_gemini_reply(input_mode, conversation_style, message, history, system_prompt):
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
-        return _fallback_reply("Gemini API key 尚未設定，請先在 .env 加上 GEMINI_API_KEY。")
+        return _get_mock_reply(
+            input_mode=input_mode,
+            conversation_style=conversation_style,
+            message=message,
+            history=history,
+            system_prompt=system_prompt,
+        )
 
     model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite").strip()
     endpoint = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
         f"{model}:generateContent"
     )
-    prompt = _build_gemini_instruction(input_mode, conversation_style, system_prompt)
+    prompt = build_gemini_instruction(
+        input_mode,
+        conversation_style,
+        system_prompt,
+        history=history,
+    )
     contents = _build_gemini_contents(prompt, message, history)
     payload = {
         "contents": contents,
@@ -126,64 +144,26 @@ def _get_gemini_reply(input_mode, conversation_style, message, history, system_p
         with urllib.request.urlopen(request, timeout=30) as response:
             response_data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
-        details = error.read().decode("utf-8", errors="replace")
-        return _fallback_reply(f"Gemini API 回傳錯誤：HTTP {error.code}。{details[:160]}")
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
-        return _fallback_reply(f"目前無法連線 Gemini API：{error}")
+        return _ai_error_reply(_gemini_error_message(error))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return _ai_error_reply("目前 AI 連線不穩，請稍後再試。")
 
     text = _extract_gemini_text(response_data)
     parsed = _parse_gemini_json(text)
     if not parsed:
-        return _fallback_reply("Gemini 回覆格式無法解析，請稍後再試。")
+        return _ai_error_reply("AI 回覆格式暫時無法解析，請再試一次。")
 
-    return _normalize_gemini_result(parsed)
+    return _normalize_gemini_result(parsed, input_mode)
 
 
-def _build_gemini_instruction(input_mode, conversation_style, system_prompt):
-    service_list = "\n".join(
-        f"- {name}: {details['reason']}" for name, details in SERVICE_HINTS.items()
-    )
-    mode_note = (
-        "使用者只能點按鈕回答，請用明確、短句、單一問題引導。"
-        if input_mode == "button"
-        else "使用者可以自由輸入，請自然追問但避免過長。"
-    )
-    style_note = (
-        "task-led：用步驟式諮詢，逐步確認需求並盡快整理建議。"
-        if conversation_style == "task"
-        else "topic-led：先圍繞髮況與保養主題對話，再連結到適合服務。"
-    )
+def _gemini_error_message(error):
+    if error.code == 503:
+        return "目前 AI 使用量較高，請稍後再試一次。"
 
-    return (
-        f"{system_prompt}\n\n"
-        "你是 ZOBOT，美髮服務諮詢助理。請一律使用繁體中文。\n"
-        "你只能根據下列四項服務給出諮詢建議，不要編造不存在的服務：\n"
-        f"{service_list}\n\n"
-        f"互動模式：{mode_note}\n"
-        f"對話風格：{style_note}\n\n"
-        "重要規則：\n"
-        "- 你可以詢問、說明與推薦，但不能替使用者完成預約或服務選擇。\n"
-        "- 最終服務選擇只能由左側服務卡片完成，不要說「我已幫你選擇」。\n"
-        "- 如果資訊不足，is_final 必須是 false，reply 用一句問題繼續詢問。\n"
-        "- 如果已有足夠資訊，is_final 設為 true，final_output 填入推薦摘要。\n"
-        "- 回覆必須是純 JSON，不要 markdown，不要加 JSON 以外文字。\n\n"
-        "JSON 格式必須完全符合：\n"
-        "{\n"
-        '  "reply": "string",\n'
-        '  "is_final": false,\n'
-        '  "final_output": null\n'
-        "}\n"
-        "或：\n"
-        "{\n"
-        '  "reply": "我已根據你的需求整理出一個參考建議，請查看下方摘要。",\n'
-        '  "is_final": true,\n'
-        '  "final_output": {\n'
-        '    "recommended_service": "日本哥德式染髮|日本資生堂染髮|哥德式護髮|資生堂護髮",\n'
-        '    "reason": "string",\n'
-        '    "next_step": "請參考此建議，並從左側服務內容中選擇你最想預約的方案。"\n'
-        "  }\n"
-        "}"
-    )
+    if error.code in {401, 403}:
+        return "目前 AI 金鑰或專案權限無法使用，請通知研究人員。"
+
+    return "目前 AI 暫時無法回覆，請稍後再試。"
 
 
 def _build_gemini_contents(prompt, message, history):
@@ -235,10 +215,11 @@ def _parse_gemini_json(text):
             return None
 
 
-def _normalize_gemini_result(result):
+def _normalize_gemini_result(result, input_mode):
     reply = str(result.get("reply") or "").strip()
     is_final = bool(result.get("is_final"))
     final_output = result.get("final_output") if is_final else None
+    buttons = _normalize_buttons(result.get("buttons"), input_mode, is_final)
 
     if not reply:
         reply = "我想再多了解一點。你目前比較想染髮，還是改善乾燥、毛躁或受損髮況？"
@@ -250,9 +231,34 @@ def _normalize_gemini_result(result):
 
     return {
         "reply": reply,
+        "buttons": buttons,
+        "source": "gemini",
         "is_final": is_final,
         "final_output": final_output if is_final else None,
     }
+
+
+def _normalize_buttons(buttons, input_mode, is_final):
+    if input_mode != "button" or is_final:
+        return []
+
+    if not isinstance(buttons, list):
+        buttons = []
+
+    normalized = []
+    for button in buttons:
+        label = str(button).strip()
+        if not label:
+            continue
+        if label == UNCERTAIN_BUTTON_LABEL:
+            continue
+        if label in normalized:
+            continue
+        normalized.append(label)
+
+    normalized = normalized[: MAX_BUTTON_OPTIONS - 1]
+    normalized.append(UNCERTAIN_BUTTON_LABEL)
+    return normalized
 
 
 def _normalize_final_output(final_output):
@@ -273,6 +279,17 @@ def _normalize_final_output(final_output):
 def _fallback_reply(reason):
     return {
         "reply": reason,
+        "source": "error",
+        "is_final": False,
+        "final_output": None,
+    }
+
+
+def _ai_error_reply(reason):
+    return {
+        "reply": reason,
+        "buttons": [],
+        "source": "error",
         "is_final": False,
         "final_output": None,
     }
