@@ -1,3 +1,9 @@
+import json
+import os
+import urllib.error
+import urllib.request
+
+
 SERVICE_HINTS = {
     "日本哥德式染髮": {
         "reason": "適合想染髮，同時在意染後髮質與修護感的顧客。",
@@ -19,6 +25,26 @@ SERVICE_HINTS = {
 
 
 def get_chatbot_reply(input_mode, conversation_style, message, history, system_prompt):
+    provider = os.getenv("AI_PROVIDER", "mock").strip().lower()
+    if provider == "gemini":
+        return _get_gemini_reply(
+            input_mode=input_mode,
+            conversation_style=conversation_style,
+            message=message,
+            history=history,
+            system_prompt=system_prompt,
+        )
+
+    return _get_mock_reply(
+        input_mode=input_mode,
+        conversation_style=conversation_style,
+        message=message,
+        history=history,
+        system_prompt=system_prompt,
+    )
+
+
+def _get_mock_reply(input_mode, conversation_style, message, history, system_prompt):
     """Return a mock chatbot response with an optional final output.
 
     TODO: Replace the mock logic below with Hermes Agent API integration.
@@ -64,6 +90,192 @@ def get_chatbot_reply(input_mode, conversation_style, message, history, system_p
         reply = _topic_led_reply(message, input_mode, user_turn_count)
 
     return {"reply": reply, "is_final": False, "final_output": None}
+
+
+def _get_gemini_reply(input_mode, conversation_style, message, history, system_prompt):
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return _fallback_reply("Gemini API key 尚未設定，請先在 .env 加上 GEMINI_API_KEY。")
+
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite").strip()
+    endpoint = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model}:generateContent"
+    )
+    prompt = _build_gemini_instruction(input_mode, conversation_style, system_prompt)
+    contents = _build_gemini_contents(prompt, message, history)
+    payload = {
+        "contents": contents,
+        "generationConfig": {
+            "temperature": 0.4,
+            "response_mime_type": "application/json",
+        },
+    }
+
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": api_key,
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            response_data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        details = error.read().decode("utf-8", errors="replace")
+        return _fallback_reply(f"Gemini API 回傳錯誤：HTTP {error.code}。{details[:160]}")
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+        return _fallback_reply(f"目前無法連線 Gemini API：{error}")
+
+    text = _extract_gemini_text(response_data)
+    parsed = _parse_gemini_json(text)
+    if not parsed:
+        return _fallback_reply("Gemini 回覆格式無法解析，請稍後再試。")
+
+    return _normalize_gemini_result(parsed)
+
+
+def _build_gemini_instruction(input_mode, conversation_style, system_prompt):
+    service_list = "\n".join(
+        f"- {name}: {details['reason']}" for name, details in SERVICE_HINTS.items()
+    )
+    mode_note = (
+        "使用者只能點按鈕回答，請用明確、短句、單一問題引導。"
+        if input_mode == "button"
+        else "使用者可以自由輸入，請自然追問但避免過長。"
+    )
+    style_note = (
+        "task-led：用步驟式諮詢，逐步確認需求並盡快整理建議。"
+        if conversation_style == "task"
+        else "topic-led：先圍繞髮況與保養主題對話，再連結到適合服務。"
+    )
+
+    return (
+        f"{system_prompt}\n\n"
+        "你是 ZOBOT，美髮服務諮詢助理。請一律使用繁體中文。\n"
+        "你只能根據下列四項服務給出諮詢建議，不要編造不存在的服務：\n"
+        f"{service_list}\n\n"
+        f"互動模式：{mode_note}\n"
+        f"對話風格：{style_note}\n\n"
+        "重要規則：\n"
+        "- 你可以詢問、說明與推薦，但不能替使用者完成預約或服務選擇。\n"
+        "- 最終服務選擇只能由左側服務卡片完成，不要說「我已幫你選擇」。\n"
+        "- 如果資訊不足，is_final 必須是 false，reply 用一句問題繼續詢問。\n"
+        "- 如果已有足夠資訊，is_final 設為 true，final_output 填入推薦摘要。\n"
+        "- 回覆必須是純 JSON，不要 markdown，不要加 JSON 以外文字。\n\n"
+        "JSON 格式必須完全符合：\n"
+        "{\n"
+        '  "reply": "string",\n'
+        '  "is_final": false,\n'
+        '  "final_output": null\n'
+        "}\n"
+        "或：\n"
+        "{\n"
+        '  "reply": "我已根據你的需求整理出一個參考建議，請查看下方摘要。",\n'
+        '  "is_final": true,\n'
+        '  "final_output": {\n'
+        '    "recommended_service": "日本哥德式染髮|日本資生堂染髮|哥德式護髮|資生堂護髮",\n'
+        '    "reason": "string",\n'
+        '    "next_step": "請參考此建議，並從左側服務內容中選擇你最想預約的方案。"\n'
+        "  }\n"
+        "}"
+    )
+
+
+def _build_gemini_contents(prompt, message, history):
+    contents = []
+    if isinstance(history, list):
+        recent_history = history[-10:]
+        for index, item in enumerate(recent_history):
+            role = "model" if item.get("role") == "assistant" else "user"
+            content = (item.get("content") or "").strip()
+            if index == len(recent_history) - 1 and role == "user":
+                content = f"{prompt}\n\n目前使用者訊息：{content}"
+            if content:
+                contents.append({"role": role, "parts": [{"text": content}]})
+
+    if not contents:
+        contents.append(
+            {
+                "role": "user",
+                "parts": [{"text": f"{prompt}\n\n目前使用者訊息：{message}"}],
+            }
+        )
+
+    return contents
+
+
+def _extract_gemini_text(response_data):
+    try:
+        parts = response_data["candidates"][0]["content"]["parts"]
+    except (KeyError, IndexError, TypeError):
+        return ""
+
+    return "".join(part.get("text", "") for part in parts if isinstance(part, dict))
+
+
+def _parse_gemini_json(text):
+    if not text:
+        return None
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return None
+        try:
+            return json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+
+
+def _normalize_gemini_result(result):
+    reply = str(result.get("reply") or "").strip()
+    is_final = bool(result.get("is_final"))
+    final_output = result.get("final_output") if is_final else None
+
+    if not reply:
+        reply = "我想再多了解一點。你目前比較想染髮，還是改善乾燥、毛躁或受損髮況？"
+
+    if is_final:
+        final_output = _normalize_final_output(final_output)
+        if not final_output:
+            is_final = False
+
+    return {
+        "reply": reply,
+        "is_final": is_final,
+        "final_output": final_output if is_final else None,
+    }
+
+
+def _normalize_final_output(final_output):
+    if not isinstance(final_output, dict):
+        return None
+
+    service_name = final_output.get("recommended_service")
+    if service_name not in SERVICE_HINTS:
+        return None
+
+    return {
+        "recommended_service": service_name,
+        "reason": str(final_output.get("reason") or SERVICE_HINTS[service_name]["reason"]),
+        "next_step": "請參考此建議，並從左側服務內容中選擇你最想預約的方案。",
+    }
+
+
+def _fallback_reply(reason):
+    return {
+        "reply": reason,
+        "is_final": False,
+        "final_output": None,
+    }
 
 
 def _count_user_turns(history):
