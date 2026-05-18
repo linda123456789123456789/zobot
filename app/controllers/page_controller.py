@@ -6,16 +6,36 @@ from app.services.button_flow import get_button_options, get_initial_question
 page_bp = Blueprint("pages", __name__)
 
 CONDITIONS = {
-    "A": {"input_mode": "button", "conversation_style": "task"},
-    "B": {"input_mode": "button", "conversation_style": "topic"},
-    "C": {"input_mode": "text", "conversation_style": "task"},
-    "D": {"input_mode": "text", "conversation_style": "topic"},
+    "A": {
+        "input_mode": "button",
+        "conversation_style": "task",
+        "label": "按鈕選項 × 任務導向",
+        "description": "參與者用按鈕回答，ZOBOT 依步驟引導到服務建議。",
+    },
+    "B": {
+        "input_mode": "button",
+        "conversation_style": "topic",
+        "label": "按鈕選項 × 主題導向",
+        "description": "參與者用按鈕回答，ZOBOT 先從髮況主題討論再整理建議。",
+    },
+    "C": {
+        "input_mode": "text",
+        "conversation_style": "task",
+        "label": "自由輸入 × 任務導向",
+        "description": "參與者自由打字，ZOBOT 依步驟詢問並引導到服務建議。",
+    },
+    "D": {
+        "input_mode": "text",
+        "conversation_style": "topic",
+        "label": "自由輸入 × 主題導向",
+        "description": "參與者自由打字，ZOBOT 先討論髮況與需求再整理建議。",
+    },
 }
 
 
 @page_bp.get("/")
 def index():
-    return render_template("condition_select.html", conditions=CONDITIONS.keys())
+    return render_template("condition_select.html", conditions=CONDITIONS.items())
 
 
 @page_bp.get("/select-condition/<condition>")
