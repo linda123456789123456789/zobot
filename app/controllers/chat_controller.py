@@ -29,7 +29,7 @@ def chat_message():
     if not message:
         return jsonify({"error": "Message is required"}), 400
 
-    system_prompt = build_system_prompt(conversation_style)
+    system_prompt = build_system_prompt(input_mode, conversation_style)
     chatbot_response = get_chatbot_reply(
         input_mode=input_mode,
         conversation_style=conversation_style,
@@ -39,18 +39,25 @@ def chat_message():
     )
     next_question = get_next_question(input_mode, conversation_style, history)
     reply = chatbot_response["reply"]
-    if input_mode == "button" and not chatbot_response["is_final"] and next_question:
-        reply = next_question
+    buttons = chatbot_response.get("buttons")
+    response_source = chatbot_response.get("source")
+
+    if input_mode == "button" and not chatbot_response["is_final"]:
+        if not buttons and response_source == "mock" and next_question:
+            reply = next_question
+            buttons = get_button_options(
+                input_mode,
+                conversation_style,
+                history=history,
+                is_final=False,
+            )
+    else:
+        buttons = []
 
     return jsonify(
         {
             "reply": reply,
-            "buttons": get_button_options(
-                input_mode,
-                conversation_style,
-                history=history,
-                is_final=chatbot_response["is_final"],
-            ),
+            "buttons": buttons or [],
             "is_final": chatbot_response["is_final"],
             "final_output": chatbot_response["final_output"],
         }

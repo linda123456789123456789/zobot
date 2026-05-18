@@ -25,45 +25,22 @@
     </section>
 
     <section class="service-sections" aria-label="Hair services">
-      <section class="service-section" aria-labelledby="color-services-title">
-        <h2 id="color-services-title">染髮服務</h2>
-        <div class="service-grid">
-          <article class="service-card">
-            <div>
-              <h3>日本資生堂染髮</h3>
-              <p>適合想改變髮色、提升整體造型，並重視染後質感的顧客。</p>
-            </div>
-            <button type="button" class="service-send" data-service-choice="日本資生堂染髮">選擇此服務</button>
-          </article>
-          <article class="service-card">
-            <div>
-              <h3>日本哥德式染髮</h3>
-              <p>適合想染髮，同時在意染後髮質與修護感的顧客。</p>
-            </div>
-            <button type="button" class="service-send" data-service-choice="日本哥德式染髮">選擇此服務</button>
-          </article>
-        </div>
-      </section>
-
-      <section class="service-section" aria-labelledby="treatment-services-title">
-        <h2 id="treatment-services-title">護髮服務</h2>
-        <div class="service-grid">
-          <article class="service-card">
-            <div>
-              <h3>哥德式護髮</h3>
-              <p>適合染燙後受損、乾燥或髮尾毛裂，需要深層修護的顧客。</p>
-            </div>
-            <button type="button" class="service-send" data-service-choice="哥德式護髮">選擇此服務</button>
-          </article>
-          <article class="service-card">
-            <div>
-              <h3>資生堂護髮</h3>
-              <p>適合想提升柔順度、光澤與髮絲觸感的顧客。</p>
-            </div>
-            <button type="button" class="service-send" data-service-choice="資生堂護髮">選擇此服務</button>
-          </article>
-        </div>
-      </section>
+      {% for category in service_categories %}
+        <section class="service-section" aria-labelledby="service-category-{{ loop.index }}">
+          <h2 id="service-category-{{ loop.index }}">{{ category.title }}</h2>
+          <div class="service-grid">
+            {% for service in category.services %}
+              <article class="service-card">
+                <div>
+                  <h3>{{ service.name }}</h3>
+                  <p>{{ service.description }}</p>
+                </div>
+                <button type="button" class="service-send" data-service-choice="{{ service.name }}">選擇此服務</button>
+              </article>
+            {% endfor %}
+          </div>
+        </section>
+      {% endfor %}
     </section>
   </section>
 

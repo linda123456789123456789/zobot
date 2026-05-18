@@ -8,8 +8,11 @@
     <p class="researcher-note">Choose one condition before handing the page to the participant.</p>
 
     <div class="condition-buttons">
-      {% for condition in conditions %}
-        <a href="{{ url_for('pages.select_condition', condition=condition) }}">Condition {{ condition }}</a>
+      {% for condition, details in conditions %}
+        <a href="{{ url_for('pages.select_condition', condition=condition) }}">
+          <strong>{{ details.label }}</strong>
+          <small>{{ details.description }}</small>
+        </a>
       {% endfor %}
     </div>
   </section>

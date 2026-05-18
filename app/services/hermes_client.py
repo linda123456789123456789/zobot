@@ -1,24 +1,37 @@
-SERVICE_HINTS = {
-    "日本哥德式染髮": {
-        "reason": "適合想染髮，同時在意染後髮質與修護感的顧客。",
-        "keywords": ["哥德式染髮", "染後", "染髮修護", "染後髮質"],
-    },
-    "日本資生堂染髮": {
-        "reason": "適合想改變髮色、提升整體造型，並重視染後質感的顧客。",
-        "keywords": ["資生堂染髮", "染髮", "髮色", "顏色", "造型", "質感"],
-    },
-    "哥德式護髮": {
-        "reason": "適合染燙後受損、乾燥或髮尾毛裂，需要深層修護的顧客。",
-        "keywords": ["哥德式護髮", "受損", "修護", "深層", "染燙", "髮尾毛裂"],
-    },
-    "資生堂護髮": {
-        "reason": "適合想提升柔順度、光澤與髮絲觸感的顧客。",
-        "keywords": ["資生堂護髮", "柔順", "光澤", "毛躁", "觸感"],
-    },
-}
+import json
+import os
+import urllib.error
+import urllib.request
+
+from app.services.prompt_builder import build_gemini_instruction
+from app.services.service_catalog import SERVICE_HINTS
+
+
+MAX_BUTTON_OPTIONS = 3
+UNCERTAIN_BUTTON_LABEL = "我不確定"
 
 
 def get_chatbot_reply(input_mode, conversation_style, message, history, system_prompt):
+    provider = os.getenv("AI_PROVIDER", "mock").strip().lower()
+    if provider == "gemini":
+        return _get_gemini_reply(
+            input_mode=input_mode,
+            conversation_style=conversation_style,
+            message=message,
+            history=history,
+            system_prompt=system_prompt,
+        )
+
+    return _get_mock_reply(
+        input_mode=input_mode,
+        conversation_style=conversation_style,
+        message=message,
+        history=history,
+        system_prompt=system_prompt,
+    )
+
+
+def _get_mock_reply(input_mode, conversation_style, message, history, system_prompt):
     """Return a mock chatbot response with an optional final output.
 
     TODO: Replace the mock logic below with Hermes Agent API integration.
@@ -54,6 +67,7 @@ def get_chatbot_reply(input_mode, conversation_style, message, history, system_p
     if final_output:
         return {
             "reply": "我已根據你的需求整理出一個參考建議，請查看下方摘要。",
+            "source": "mock",
             "is_final": True,
             "final_output": final_output,
         }
@@ -63,7 +77,203 @@ def get_chatbot_reply(input_mode, conversation_style, message, history, system_p
     else:
         reply = _topic_led_reply(message, input_mode, user_turn_count)
 
-    return {"reply": reply, "is_final": False, "final_output": None}
+    return {"reply": reply, "source": "mock", "is_final": False, "final_output": None}
+
+
+def _get_gemini_reply(input_mode, conversation_style, message, history, system_prompt):
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return _get_mock_reply(
+            input_mode=input_mode,
+            conversation_style=conversation_style,
+            message=message,
+            history=history,
+            system_prompt=system_prompt,
+        )
+
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite").strip()
+    endpoint = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model}:generateContent"
+    )
+    prompt = build_gemini_instruction(
+        input_mode,
+        conversation_style,
+        system_prompt,
+        history=history,
+    )
+    contents = _build_gemini_contents(prompt, message, history)
+    payload = {
+        "contents": contents,
+        "generationConfig": {
+            "temperature": 0.4,
+            "response_mime_type": "application/json",
+        },
+    }
+
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": api_key,
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            response_data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        return _ai_error_reply(_gemini_error_message(error))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return _ai_error_reply("目前 AI 連線不穩，請稍後再試。")
+
+    text = _extract_gemini_text(response_data)
+    parsed = _parse_gemini_json(text)
+    if not parsed:
+        return _ai_error_reply("AI 回覆格式暫時無法解析，請再試一次。")
+
+    return _normalize_gemini_result(parsed, input_mode)
+
+
+def _gemini_error_message(error):
+    if error.code == 503:
+        return "目前 AI 使用量較高，請稍後再試一次。"
+
+    if error.code in {401, 403}:
+        return "目前 AI 金鑰或專案權限無法使用，請通知研究人員。"
+
+    return "目前 AI 暫時無法回覆，請稍後再試。"
+
+
+def _build_gemini_contents(prompt, message, history):
+    contents = []
+    if isinstance(history, list):
+        recent_history = history[-10:]
+        for index, item in enumerate(recent_history):
+            role = "model" if item.get("role") == "assistant" else "user"
+            content = (item.get("content") or "").strip()
+            if index == len(recent_history) - 1 and role == "user":
+                content = f"{prompt}\n\n目前使用者訊息：{content}"
+            if content:
+                contents.append({"role": role, "parts": [{"text": content}]})
+
+    if not contents:
+        contents.append(
+            {
+                "role": "user",
+                "parts": [{"text": f"{prompt}\n\n目前使用者訊息：{message}"}],
+            }
+        )
+
+    return contents
+
+
+def _extract_gemini_text(response_data):
+    try:
+        parts = response_data["candidates"][0]["content"]["parts"]
+    except (KeyError, IndexError, TypeError):
+        return ""
+
+    return "".join(part.get("text", "") for part in parts if isinstance(part, dict))
+
+
+def _parse_gemini_json(text):
+    if not text:
+        return None
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return None
+        try:
+            return json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+
+
+def _normalize_gemini_result(result, input_mode):
+    reply = str(result.get("reply") or "").strip()
+    is_final = bool(result.get("is_final"))
+    final_output = result.get("final_output") if is_final else None
+    buttons = _normalize_buttons(result.get("buttons"), input_mode, is_final)
+
+    if not reply:
+        reply = "我想再多了解一點。你目前比較想染髮，還是改善乾燥、毛躁或受損髮況？"
+
+    if is_final:
+        final_output = _normalize_final_output(final_output)
+        if not final_output:
+            is_final = False
+
+    return {
+        "reply": reply,
+        "buttons": buttons,
+        "source": "gemini",
+        "is_final": is_final,
+        "final_output": final_output if is_final else None,
+    }
+
+
+def _normalize_buttons(buttons, input_mode, is_final):
+    if input_mode != "button" or is_final:
+        return []
+
+    if not isinstance(buttons, list):
+        buttons = []
+
+    normalized = []
+    for button in buttons:
+        label = str(button).strip()
+        if not label:
+            continue
+        if label == UNCERTAIN_BUTTON_LABEL:
+            continue
+        if label in normalized:
+            continue
+        normalized.append(label)
+
+    normalized = normalized[: MAX_BUTTON_OPTIONS - 1]
+    normalized.append(UNCERTAIN_BUTTON_LABEL)
+    return normalized
+
+
+def _normalize_final_output(final_output):
+    if not isinstance(final_output, dict):
+        return None
+
+    service_name = final_output.get("recommended_service")
+    if service_name not in SERVICE_HINTS:
+        return None
+
+    return {
+        "recommended_service": service_name,
+        "reason": str(final_output.get("reason") or SERVICE_HINTS[service_name]["reason"]),
+        "next_step": "請參考此建議，並從左側服務內容中選擇你最想預約的方案。",
+    }
+
+
+def _fallback_reply(reason):
+    return {
+        "reply": reason,
+        "source": "error",
+        "is_final": False,
+        "final_output": None,
+    }
+
+
+def _ai_error_reply(reason):
+    return {
+        "reply": reason,
+        "buttons": [],
+        "source": "error",
+        "is_final": False,
+        "final_output": None,
+    }
 
 
 def _count_user_turns(history):
