@@ -18,8 +18,11 @@
   const completionCardEl = document.querySelector("#completion-card");
   const completedServiceEl = document.querySelector("#completed-service");
   const initialGreeting = shell.dataset.initialGreeting;
+  const maxButtonOptions = 3;
   const initialButtonLabels = buttonOptionsEl
-    ? Array.from(buttonOptionsEl.querySelectorAll("[data-message]")).map((button) => button.dataset.message)
+    ? Array.from(buttonOptionsEl.querySelectorAll("[data-message]"))
+        .map((button) => button.dataset.message)
+        .slice(0, maxButtonOptions)
     : [];
   const history = [];
 
@@ -37,7 +40,7 @@
     }
 
     buttonOptionsEl.innerHTML = "";
-    buttons.forEach((label) => {
+    buttons.slice(0, maxButtonOptions).forEach((label) => {
       const button = document.createElement("button");
       button.type = "button";
       button.className = "chat-option";
