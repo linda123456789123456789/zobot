@@ -1,6 +1,7 @@
 from flask import Blueprint, redirect, render_template, request, url_for
 
 from app.services.button_flow import get_button_options, get_initial_question
+from app.services.service_catalog import SERVICE_CATEGORIES
 
 
 page_bp = Blueprint("pages", __name__)
@@ -64,4 +65,5 @@ def chat_page():
         conversation_style=conversation_style,
         initial_question=get_initial_question(input_mode, conversation_style),
         initial_buttons=get_button_options(input_mode, conversation_style),
+        service_categories=SERVICE_CATEGORIES,
     )

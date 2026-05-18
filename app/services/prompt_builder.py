@@ -1,9 +1,4 @@
-SERVICE_OPTIONS = {
-    "日本資生堂染髮": "適合想改變髮色、提升整體造型，並重視染後質感的顧客。",
-    "日本哥德式染髮": "適合想染髮，同時在意染後髮質與修護感的顧客。",
-    "哥德式護髮": "適合染燙後受損、乾燥或髮尾毛裂，需要深層修護的顧客。",
-    "資生堂護髮": "適合想提升柔順度、光澤與髮絲觸感的顧客。",
-}
+from app.services.service_catalog import SERVICE_OPTIONS
 
 TURN_LIMITS = {
     ("button", "task"): 3,
@@ -31,6 +26,7 @@ def build_system_prompt(input_mode, conversation_style):
         "- 使用者選「我不確定」時，代表資訊不足；請降低假設，改問更容易回答的澄清問題，不要直接強行推薦。\n"
         "- 不要替使用者完成預約或服務選擇；最後選擇只能由頁面左側服務卡片完成。\n"
         "- 資訊足夠時，可以給 final_output，但 final_output 只是諮詢建議。\n"
+        "- final_output.reason 必須同時說明使用者的需求或髮況，以及推薦服務在頁面上的服務特色。\n"
         "- 一律使用繁體中文。\n"
     )
 
@@ -42,7 +38,7 @@ def build_gemini_instruction(input_mode, conversation_style, system_prompt, hist
         "請回傳純 JSON，不要 markdown，不要加 JSON 以外文字。\n\n"
         f"{_json_schema_instruction(input_mode)}\n"
         f"{_button_json_instruction(input_mode)}"
-        "final_output.recommended_service 必須完全等於四個服務名稱之一。"
+        "final_output.recommended_service 必須完全等於頁面上的四個服務名稱之一。"
     )
 
 
