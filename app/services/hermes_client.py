@@ -4,10 +4,10 @@ import urllib.error
 import urllib.request
 
 from app.services.prompt_builder import build_gemini_instruction
-from app.services.service_catalog import SERVICE_HINTS
+from app.services.service_catalog import RECOMMENDATION_RULES, SERVICE_HINTS
 
 
-MAX_BUTTON_OPTIONS = 3
+MAX_BUTTON_OPTIONS = 4
 UNCERTAIN_BUTTON_LABEL = "我不確定"
 
 
@@ -314,9 +314,11 @@ def _build_final_output(conversation_text, allow_inferred_recommendation):
         if service_name in conversation_text:
             return _final_output_for(service_name)
 
-        if allow_inferred_recommendation and any(
-            keyword in conversation_text for keyword in details["keywords"]
-        ):
+    if not allow_inferred_recommendation:
+        return None
+
+    for service_name, keywords in RECOMMENDATION_RULES:
+        if any(keyword in conversation_text for keyword in keywords):
             return _final_output_for(service_name)
 
     return None
@@ -331,26 +333,39 @@ def _final_output_for(service_name):
 
 
 def _build_default_final_output(conversation_text):
-    if "染" in conversation_text or "髮色" in conversation_text or "顏色" in conversation_text:
-        if "修護" in conversation_text or "染後" in conversation_text or "受損" in conversation_text:
-            service_name = "日本哥德式染髮"
-        else:
-            service_name = "日本資生堂染髮"
-    elif "乾" in conversation_text or "受損" in conversation_text or "髮尾毛裂" in conversation_text:
+    if "染後" in conversation_text or "染髮又在意髮質" in conversation_text:
+        service_name = "日本哥德式染髮"
+    elif "補染" in conversation_text or "補髮根" in conversation_text:
+        service_name = "補染"
+    elif "漂" in conversation_text or "淺色" in conversation_text or "特殊髮色" in conversation_text:
+        service_name = "漂髮"
+    elif "瀏海" in conversation_text:
+        service_name = "燙瀏海"
+    elif "髮根" in conversation_text or "蓬鬆" in conversation_text or "頭頂塌" in conversation_text:
+        service_name = "髮根燙"
+    elif "燙後" in conversation_text or "燙髮又重視修護" in conversation_text:
+        service_name = "日本哥德式燙髮"
+    elif "燙" in conversation_text or "捲度" in conversation_text or "整理造型" in conversation_text:
+        service_name = "日本資生堂燙髮"
+    elif "染" in conversation_text or "髮色" in conversation_text or "顏色" in conversation_text:
+        service_name = "日本資生堂染髮"
+    elif "深層" in conversation_text or "受損" in conversation_text or "髮尾毛裂" in conversation_text or "髮尾乾燥" in conversation_text:
         service_name = "哥德式護髮"
-    elif "毛躁" in conversation_text or "柔順" in conversation_text or "光澤" in conversation_text:
-        service_name = "資生堂護髮"
+    elif "日常保養" in conversation_text or "入門護髮" in conversation_text or "基礎修護" in conversation_text or "光澤" in conversation_text:
+        service_name = "鉑金修護"
+    elif "毛躁" in conversation_text or "柔順" in conversation_text or "觸感" in conversation_text or "打結" in conversation_text:
+        service_name = "哥德式可洛娜三劑式護髮"
     else:
-        service_name = "資生堂護髮"
+        service_name = "鉑金修護"
 
     return _final_output_for(service_name)
 
 
 def _task_led_reply(user_turn_count):
     if user_turn_count <= 1:
-        return "第一步，我想先了解你的需求方向。你目前比較想改變髮色，還是改善乾燥、毛躁或受損髮況？"
+        return "第一步，我想先了解你的需求方向。你目前比較想改變髮色、調整捲度造型，還是改善乾燥、毛躁或受損髮況？"
 
-    return "第二步，請補充你的期待。你比較重視染後質感、修護感、柔順光澤，還是整體造型變化？"
+    return "第二步，請補充你的期待。你比較重視染燙後修護、柔順光澤、髮根蓬鬆，還是整體造型變化？"
 
 
 def _topic_led_reply(message, input_mode, user_turn_count):
@@ -358,12 +373,12 @@ def _topic_led_reply(message, input_mode, user_turn_count):
         return "乾燥或毛躁通常可以先從保濕、柔順度與髮絲表層狀態來看。你平常吹整後比較在意觸感還是光澤？"
 
     if "染" in message or "燙" in message:
-        return "如果你想染髮或剛染燙過，可以一起考量髮色變化、染後質感與修護需求。你比較重視造型改變還是染後髮質？"
+        return "如果你想染髮、燙髮或剛染燙過，可以一起考量造型變化、染燙後質感與修護需求。你比較重視造型改變還是染燙後髮質？"
 
     if user_turn_count >= 2:
-        return "我了解。你可以再描述最近一次染髮、護髮或整理頭髮的經驗，我會依照你的描述整理一個參考方向。"
+        return "我了解。你可以再描述最近一次染髮、燙髮、護髮或整理頭髮的經驗，我會依照你的描述整理一個參考方向。"
 
     if input_mode == "button":
-        return "我們可以先從你的需求聊起。你可以選一個主題，也可以描述想染髮或想改善的髮質問題。"
+        return "我們可以先從你的需求聊起。你可以選一個主題，也可以描述想染髮、燙髮或想改善的髮質問題。"
 
-    return "可以。先描述你的髮況、想嘗試的髮色或保養困擾，我會根據需求說明適合的服務方向。"
+    return "可以。先描述你的髮況、想嘗試的髮色、捲度造型或保養困擾，我會根據需求說明適合的服務方向。"

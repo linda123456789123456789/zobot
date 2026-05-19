@@ -4,10 +4,11 @@ A small Flask MVC-style prototype for a 2x2 salon booking chatbot experiment.
 
 This is a local research prototype. It does not include participant management, login, admin pages, surveys, or a database. Chatbot responses are mocked so the app can run without Hermes.
 
-The participant page includes both coloring and treatment services:
+The participant page includes coloring, perm, and treatment services:
 
-- 染髮服務: 日本資生堂染髮, 日本哥德式染髮
-- 護髮服務: 哥德式護髮, 資生堂護髮
+- 染髮: 日本資生堂染髮, 日本哥德式染髮, 補染, 漂髮
+- 燙髮: 日本資生堂燙髮, 日本哥德式燙髮, 髮根燙, 燙瀏海
+- 護髮: 哥德式護髮, 哥德式可洛娜三劑式護髮, 鉑金修護
 
 ## Conditions
 

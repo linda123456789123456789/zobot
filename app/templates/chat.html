@@ -21,18 +21,22 @@
         <p class="eyebrow">Salon Booking</p>
         <h2>選擇適合你的髮型服務</h2>
       </div>
-      <p>瀏覽染髮與護髮服務，並透過 ZOBOT 了解方案差異與髮況建議。</p>
+      <p>瀏覽染髮、燙髮與護髮服務，並透過 ZOBOT 了解方案差異與髮況建議。</p>
     </section>
 
     <section class="service-sections" aria-label="Hair services">
       {% for category in service_categories %}
         <section class="service-section" aria-labelledby="service-category-{{ loop.index }}">
-          <h2 id="service-category-{{ loop.index }}">{{ category.title }}</h2>
+          <div class="service-section-heading">
+            <h2 id="service-category-{{ loop.index }}">{{ category.title }}</h2>
+            <p>{{ category.subtitle }}</p>
+          </div>
           <div class="service-grid">
             {% for service in category.services %}
               <article class="service-card">
                 <div>
                   <h3>{{ service.name }}</h3>
+                  <p class="service-price">{{ service.price }}</p>
                   <p>{{ service.description }}</p>
                 </div>
                 <button type="button" class="service-send" data-service-choice="{{ service.name }}">選擇此服務</button>

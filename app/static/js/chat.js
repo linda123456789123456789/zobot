@@ -18,7 +18,7 @@
   const completionCardEl = document.querySelector("#completion-card");
   const completedServiceEl = document.querySelector("#completed-service");
   const initialGreeting = shell.dataset.initialGreeting;
-  const maxButtonOptions = 3;
+  const maxButtonOptions = 4;
   const initialButtonLabels = buttonOptionsEl
     ? Array.from(buttonOptionsEl.querySelectorAll("[data-message]"))
         .map((button) => button.dataset.message)

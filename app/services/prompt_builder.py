@@ -16,7 +16,7 @@ def build_system_prompt(input_mode, conversation_style):
     return (
         "你是 ZOBOT，一位自然、簡潔、具體的美髮諮詢助理。"
         "請像正在和顧客對話，不要像問卷或客服公告。\n\n"
-        "你只能根據下列四項店家服務提供建議，不要編造不存在的服務：\n"
+        "你只能根據下列店家服務提供建議，不要編造不存在的服務：\n"
         f"{service_list}\n\n"
         f"互動模式：{_input_mode_instruction(input_mode)}\n"
         f"對話風格：{_conversation_style_instruction(conversation_style)}\n\n"
@@ -38,7 +38,7 @@ def build_gemini_instruction(input_mode, conversation_style, system_prompt, hist
         "請回傳純 JSON，不要 markdown，不要加 JSON 以外文字。\n\n"
         f"{_json_schema_instruction(input_mode)}\n"
         f"{_button_json_instruction(input_mode)}"
-        "final_output.recommended_service 必須完全等於頁面上的四個服務名稱之一。"
+        "final_output.recommended_service 必須完全等於頁面上的服務名稱之一。"
     )
 
 
@@ -59,7 +59,7 @@ def _input_mode_instruction(input_mode):
 def _conversation_style_instruction(conversation_style):
     if conversation_style == "task":
         return (
-            "task-led。用步驟式諮詢快速釐清需求，逐步收斂到適合的染髮或護髮建議。"
+            "task-led。用步驟式諮詢快速釐清需求，逐步收斂到適合的染髮、燙髮或護髮建議。"
         )
 
     return (
@@ -84,6 +84,7 @@ def _button_json_instruction(input_mode):
 
 def _json_schema_instruction(input_mode):
     button_field = '  "buttons": ["選項一", "選項二"],\n' if input_mode == "button" else ""
+    service_names = "|".join(SERVICE_OPTIONS.keys())
     return (
         "資訊不足時：\n"
         "{\n"
@@ -97,7 +98,7 @@ def _json_schema_instruction(input_mode):
         '  "reply": "我已根據你的需求整理出一個參考建議，請查看下方摘要。",\n'
         '  "is_final": true,\n'
         '  "final_output": {\n'
-        '    "recommended_service": "日本資生堂染髮|日本哥德式染髮|哥德式護髮|資生堂護髮",\n'
+        f'    "recommended_service": "{service_names}",\n'
         '    "reason": "根據使用者需求與服務特色的具體原因",\n'
         '    "next_step": "請參考此建議，並從左側服務內容中選擇你最想預約的方案。"\n'
         "  }\n"

@@ -62,14 +62,15 @@ Future Hermes recommendations should be normalized to this shape before returnin
   "buttons": [],
   "is_final": true,
   "final_output": {
-    "recommended_service": "哥德式護髮",
-    "reason": "適合染燙後受損、乾燥或髮尾毛裂，需要深層修護的顧客。",
+    "recommended_service": "日本資生堂染髮",
+    "reason": "根據你想改變髮色並重視染後質感的需求，此服務較適合。",
     "next_step": "請參考此建議，並從左側服務內容中選擇你最想預約的方案。"
   }
 }
 ```
 
 `final_output` is a consultation result only. It is not a booking completion and does not confirm the participant's service choice.
+`recommended_service` must exactly match one service card on the left side, such as `日本資生堂染髮`, `日本哥德式染髮`, `補染`, `漂髮`, `日本資生堂燙髮`, `日本哥德式燙髮`, `髮根燙`, `燙瀏海`, `哥德式護髮`, `哥德式可洛娜三劑式護髮`, or `鉑金修護`.
 
 ## ZOBOT Role And Service Selection
 
