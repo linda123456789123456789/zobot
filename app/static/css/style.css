@@ -34,7 +34,7 @@ button {
 
 .app-shell {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 380px;
+  grid-template-columns: minmax(0, 0.9fr) minmax(440px, 0.55fr);
   gap: 24px;
   min-height: 100vh;
   padding: 24px;
@@ -198,11 +198,7 @@ h1 {
 }
 
 .service-card {
-  display: flex;
-  flex-direction: column;
-  justify-content: space-between;
-  gap: 18px;
-  min-height: 210px;
+  min-height: 170px;
   padding: 20px;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -227,19 +223,12 @@ h1 {
   font-weight: 700;
 }
 
-.service-send,
 .chat-form button {
   border: 0;
   border-radius: 8px;
   background: var(--accent);
   color: #ffffff;
   font-weight: 700;
-}
-
-.service-send {
-  min-width: 116px;
-  min-height: 40px;
-  padding: 0 12px;
 }
 
 .chat-panel {
@@ -288,6 +277,11 @@ h1 {
 .message.assistant {
   align-self: flex-start;
   background: var(--soft);
+}
+
+.waiting-message {
+  color: var(--muted);
+  font-style: italic;
 }
 
 .message.user {
@@ -379,6 +373,13 @@ h1 {
 
 .chat-option:hover {
   background: #e8f3f1;
+}
+
+.chat-option:disabled,
+.chat-form button:disabled,
+.chat-form input:disabled {
+  cursor: not-allowed;
+  opacity: 0.62;
 }
 
 .chat-form {
