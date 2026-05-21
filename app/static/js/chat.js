@@ -79,6 +79,14 @@
     }
   }
 
+  function focusTextInput() {
+    if (!inputEl || inputEl.disabled || formEl.hidden) {
+      return;
+    }
+
+    inputEl.focus();
+  }
+
   function renderButtons(buttons) {
     if (!buttonOptionsEl) {
       return;
@@ -122,6 +130,8 @@
   function resetConsultation() {
     // TODO: When Hermes integration is added, also clear the backend/Hermes session state here.
     history.length = 0;
+    isWaitingForReply = false;
+    removeWaitingMessage();
     messagesEl.innerHTML = "";
     appendMessage("assistant", initialGreeting);
     recommendationCardEl.hidden = true;
@@ -132,6 +142,8 @@
       inputEl.value = "";
     }
     setInputDisabled(false);
+    setControlsDisabled(false);
+    focusTextInput();
   }
 
   function completeServiceSelection(serviceName) {
@@ -188,6 +200,9 @@
     } finally {
       setWaitingState(false);
       setControlsDisabled(keepControlsDisabled);
+      if (!keepControlsDisabled) {
+        focusTextInput();
+      }
     }
   }
 
