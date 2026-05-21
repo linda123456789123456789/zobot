@@ -3,7 +3,7 @@ import os
 import urllib.error
 import urllib.request
 
-from app.services.prompt_builder import build_model_instruction
+from app.services.prompt_builder import build_model_instruction, get_turn_limit
 from app.services.service_catalog import RECOMMENDATION_RULES, SERVICE_HINTS
 
 
@@ -143,7 +143,14 @@ def _get_gemini_reply(input_mode, conversation_style, message, history, system_p
     if not parsed:
         return _ai_error_reply("AI 回覆格式暫時無法解析，請再試一次。")
 
-    return _normalize_model_result(parsed, input_mode, source="gemini")
+    model_response = _normalize_model_result(parsed, input_mode, source="gemini")
+    return _force_final_at_turn_limit(
+        model_response,
+        input_mode=input_mode,
+        conversation_style=conversation_style,
+        message=message,
+        history=history,
+    )
 
 
 def _get_ollama_reply(input_mode, conversation_style, message, history, system_prompt):
@@ -183,7 +190,14 @@ def _get_ollama_reply(input_mode, conversation_style, message, history, system_p
     if not parsed:
         return _ai_error_reply("本機 AI 回覆格式暫時無法解析，請再試一次。")
 
-    return _normalize_model_result(parsed, input_mode, source="ollama")
+    model_response = _normalize_model_result(parsed, input_mode, source="ollama")
+    return _force_final_at_turn_limit(
+        model_response,
+        input_mode=input_mode,
+        conversation_style=conversation_style,
+        message=message,
+        history=history,
+    )
 
 
 def _gemini_error_message(error):
@@ -288,6 +302,30 @@ def _normalize_model_result(result, input_mode, source):
         "source": source,
         "is_final": is_final,
         "final_output": final_output if is_final else None,
+    }
+
+
+def _force_final_at_turn_limit(model_response, input_mode, conversation_style, message, history):
+    if model_response["is_final"]:
+        return model_response
+
+    user_turn_count = _count_user_turns(history)
+    turn_limit = get_turn_limit(input_mode, conversation_style)
+    if user_turn_count < turn_limit:
+        return model_response
+
+    conversation_text = _conversation_text(history, message)
+    final_output = (
+        _build_final_output(conversation_text, allow_inferred_recommendation=True)
+        or _build_default_final_output(conversation_text)
+    )
+
+    return {
+        "reply": "我已根據你的需求整理出一個參考建議，請查看下方摘要。",
+        "buttons": [],
+        "source": model_response.get("source"),
+        "is_final": True,
+        "final_output": final_output,
     }
 
 
