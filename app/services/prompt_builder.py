@@ -1,11 +1,6 @@
 from app.services.service_catalog import SERVICE_OPTIONS
 
-TURN_LIMITS = {
-    ("button", "task"): 3,
-    ("button", "topic"): 3,
-    ("text", "task"): 4,
-    ("text", "topic"): 5,
-}
+MODEL_TURN_LIMIT = 10
 
 
 def build_system_prompt(input_mode, conversation_style):
@@ -43,7 +38,8 @@ def build_model_instruction(input_mode, conversation_style, system_prompt, histo
 
 
 def get_turn_limit(input_mode, conversation_style):
-    return TURN_LIMITS.get((input_mode, conversation_style), 4)
+    del input_mode, conversation_style
+    return MODEL_TURN_LIMIT
 
 
 def _input_mode_instruction(input_mode):
@@ -109,13 +105,15 @@ def _json_schema_instruction(input_mode):
 def _turn_instruction(input_mode, conversation_style, history):
     current_turn = _count_user_turns(history)
     turn_limit = get_turn_limit(input_mode, conversation_style)
-    remaining_turns = max(turn_limit - current_turn, 0)
+
+    if current_turn < turn_limit:
+        return ""
 
     return (
-        f"目前使用者已回答第 {current_turn} 輪；此情境最多 {turn_limit} 輪。\n"
-        f"剩餘可追問輪數：{remaining_turns}。\n"
-        "若尚有追問空間，請優先問最能幫助判斷服務的下一題。\n"
-        "若已達上限，請根據目前資訊整理 final_output；資訊不足時採保守建議，並在 reason 說明依據。\n"
+        f"目前使用者已回答第 {current_turn} 輪，已達此情境上限。\n"
+        "這一輪必須停止追問，請根據目前完整對話整理 final_output。\n"
+        "如果資訊仍不完整，請基於最明確的需求給出保守建議，並在 reason 說明依據。\n"
+        "is_final 必須是 true，不要回傳 buttons。\n"
     )
 
 
