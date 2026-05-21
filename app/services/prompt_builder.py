@@ -31,7 +31,7 @@ def build_system_prompt(input_mode, conversation_style):
     )
 
 
-def build_gemini_instruction(input_mode, conversation_style, system_prompt, history=None):
+def build_model_instruction(input_mode, conversation_style, system_prompt, history=None):
     return (
         f"{system_prompt}\n"
         f"{_turn_instruction(input_mode, conversation_style, history)}\n"
