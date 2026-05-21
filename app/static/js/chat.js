@@ -19,7 +19,7 @@
   const completionCardEl = document.querySelector("#completion-card");
   const completedServiceEl = document.querySelector("#completed-service");
   const initialGreeting = shell.dataset.initialGreeting;
-  const maxButtonOptions = 4;
+  const maxButtonOptions = 3;
   let isWaitingForReply = false;
   let waitingMessageEl = null;
   const initialButtonLabels = buttonOptionsEl

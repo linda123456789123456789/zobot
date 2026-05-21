@@ -7,7 +7,7 @@ from app.services.prompt_builder import build_gemini_instruction
 from app.services.service_catalog import RECOMMENDATION_RULES, SERVICE_HINTS
 
 
-MAX_BUTTON_OPTIONS = 4
+MAX_BUTTON_OPTIONS = 3
 UNCERTAIN_BUTTON_LABEL = "我不確定"
 
 
