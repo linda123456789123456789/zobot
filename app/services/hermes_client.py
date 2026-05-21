@@ -3,7 +3,7 @@ import os
 import urllib.error
 import urllib.request
 
-from app.services.prompt_builder import build_gemini_instruction
+from app.services.prompt_builder import build_model_instruction
 from app.services.service_catalog import RECOMMENDATION_RULES, SERVICE_HINTS
 
 
@@ -15,6 +15,15 @@ def get_chatbot_reply(input_mode, conversation_style, message, history, system_p
     provider = os.getenv("AI_PROVIDER", "mock").strip().lower()
     if provider == "gemini":
         return _get_gemini_reply(
+            input_mode=input_mode,
+            conversation_style=conversation_style,
+            message=message,
+            history=history,
+            system_prompt=system_prompt,
+        )
+
+    if provider == "ollama":
+        return _get_ollama_reply(
             input_mode=input_mode,
             conversation_style=conversation_style,
             message=message,
@@ -96,7 +105,7 @@ def _get_gemini_reply(input_mode, conversation_style, message, history, system_p
         "https://generativelanguage.googleapis.com/v1beta/models/"
         f"{model}:generateContent"
     )
-    prompt = build_gemini_instruction(
+    prompt = build_model_instruction(
         input_mode,
         conversation_style,
         system_prompt,
@@ -130,11 +139,51 @@ def _get_gemini_reply(input_mode, conversation_style, message, history, system_p
         return _ai_error_reply("目前 AI 連線不穩，請稍後再試。")
 
     text = _extract_gemini_text(response_data)
-    parsed = _parse_gemini_json(text)
+    parsed = _parse_model_json(text)
     if not parsed:
         return _ai_error_reply("AI 回覆格式暫時無法解析，請再試一次。")
 
-    return _normalize_gemini_result(parsed, input_mode)
+    return _normalize_model_result(parsed, input_mode, source="gemini")
+
+
+def _get_ollama_reply(input_mode, conversation_style, message, history, system_prompt):
+    model = os.getenv("OLLAMA_MODEL", "gemma3:4b").strip()
+    endpoint = os.getenv("OLLAMA_API_URL", "http://localhost:11434/api/chat").strip()
+    prompt = build_model_instruction(
+        input_mode,
+        conversation_style,
+        system_prompt,
+        history=history,
+    )
+    payload = {
+        "model": model,
+        "messages": _build_ollama_messages(prompt, message, history),
+        "format": "json",
+        "stream": False,
+        "options": {
+            "temperature": 0.4,
+        },
+    }
+
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=90) as response:
+            response_data = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return _ai_error_reply("目前本機 AI 無法回覆，請確認 Ollama 是否已啟動。")
+
+    text = _extract_ollama_text(response_data)
+    parsed = _parse_model_json(text)
+    if not parsed:
+        return _ai_error_reply("本機 AI 回覆格式暫時無法解析，請再試一次。")
+
+    return _normalize_model_result(parsed, input_mode, source="ollama")
 
 
 def _gemini_error_message(error):
@@ -170,6 +219,22 @@ def _build_gemini_contents(prompt, message, history):
     return contents
 
 
+def _build_ollama_messages(prompt, message, history):
+    messages = [{"role": "system", "content": prompt}]
+
+    if isinstance(history, list):
+        for item in history[-10:]:
+            role = "assistant" if item.get("role") == "assistant" else "user"
+            content = (item.get("content") or "").strip()
+            if content:
+                messages.append({"role": role, "content": content})
+
+    if not messages or messages[-1]["content"] != message:
+        messages.append({"role": "user", "content": message})
+
+    return messages
+
+
 def _extract_gemini_text(response_data):
     try:
         parts = response_data["candidates"][0]["content"]["parts"]
@@ -179,7 +244,14 @@ def _extract_gemini_text(response_data):
     return "".join(part.get("text", "") for part in parts if isinstance(part, dict))
 
 
-def _parse_gemini_json(text):
+def _extract_ollama_text(response_data):
+    try:
+        return response_data["message"]["content"]
+    except (KeyError, TypeError):
+        return ""
+
+
+def _parse_model_json(text):
     if not text:
         return None
 
@@ -196,7 +268,7 @@ def _parse_gemini_json(text):
             return None
 
 
-def _normalize_gemini_result(result, input_mode):
+def _normalize_model_result(result, input_mode, source):
     reply = str(result.get("reply") or "").strip()
     is_final = bool(result.get("is_final"))
     final_output = result.get("final_output") if is_final else None
@@ -213,7 +285,7 @@ def _normalize_gemini_result(result, input_mode):
     return {
         "reply": reply,
         "buttons": buttons,
-        "source": "gemini",
+        "source": source,
         "is_final": is_final,
         "final_output": final_output if is_final else None,
     }
