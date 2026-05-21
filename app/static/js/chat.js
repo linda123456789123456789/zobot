@@ -14,10 +14,10 @@
   const recommendationCardEl = document.querySelector("#recommendation-card");
   const recommendedServiceEl = document.querySelector("#recommended-service");
   const recommendationReasonEl = document.querySelector("#recommendation-reason");
+  const recommendationNextStepTitleEl = document.querySelector("#recommendation-next-step-title");
   const recommendationNextStepEl = document.querySelector("#recommendation-next-step");
   const resetConsultationEl = document.querySelector("#reset-consultation");
-  const completionCardEl = document.querySelector("#completion-card");
-  const completedServiceEl = document.querySelector("#completed-service");
+  const serviceChoiceButtons = Array.from(document.querySelectorAll("[data-service-choice]"));
   const initialGreeting = shell.dataset.initialGreeting;
   const maxButtonOptions = 3;
   let isWaitingForReply = false;
@@ -87,6 +87,12 @@
     inputEl.focus();
   }
 
+  function setServiceChoiceEnabled(enabled) {
+    serviceChoiceButtons.forEach((button) => {
+      button.disabled = !enabled;
+    });
+  }
+
   function renderButtons(buttons) {
     if (!buttonOptionsEl) {
       return;
@@ -121,10 +127,11 @@
 
     recommendedServiceEl.textContent = finalOutput.recommended_service;
     recommendationReasonEl.textContent = finalOutput.reason;
+    recommendationNextStepTitleEl.textContent = "下一步提示";
     recommendationNextStepEl.textContent = finalOutput.next_step;
     recommendationCardEl.hidden = false;
-    completionCardEl.hidden = true;
     setInputDisabled(true);
+    setServiceChoiceEnabled(true);
   }
 
   function resetConsultation() {
@@ -135,14 +142,15 @@
     messagesEl.innerHTML = "";
     appendMessage("assistant", initialGreeting);
     recommendationCardEl.hidden = true;
-    completionCardEl.hidden = true;
-    completedServiceEl.textContent = "";
+    recommendationNextStepTitleEl.textContent = "下一步提示";
+    recommendationNextStepEl.textContent = "";
     renderButtons(initialButtonLabels);
     if (inputEl) {
       inputEl.value = "";
     }
     setInputDisabled(false);
     setControlsDisabled(false);
+    setServiceChoiceEnabled(false);
     focusTextInput();
   }
 
@@ -151,10 +159,11 @@
       return;
     }
 
-    completedServiceEl.textContent = serviceName;
-    recommendationCardEl.hidden = true;
-    completionCardEl.hidden = false;
+    recommendationNextStepTitleEl.textContent = "使用者選擇";
+    recommendationNextStepEl.textContent = `你最後選擇：${serviceName}`;
+    recommendationCardEl.hidden = false;
     setInputDisabled(true);
+    setServiceChoiceEnabled(false);
   }
 
   async function sendMessage(message) {
@@ -207,6 +216,16 @@
   }
 
   document.addEventListener("click", (event) => {
+    const serviceButton = event.target.closest("[data-service-choice]");
+    if (serviceButton) {
+      if (serviceButton.disabled) {
+        return;
+      }
+
+      completeServiceSelection(serviceButton.dataset.serviceChoice);
+      return;
+    }
+
     const button = event.target.closest("[data-message]");
     if (!button) {
       return;

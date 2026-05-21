@@ -39,6 +39,7 @@
                   <p class="service-price">{{ service.price }}</p>
                   <p>{{ service.description }}</p>
                 </div>
+                <button type="button" class="service-send" data-service-choice="{{ service.name }}" disabled>選擇此服務</button>
               </article>
             {% endfor %}
           </div>
@@ -68,18 +69,11 @@
       <p id="recommended-service" class="recommended-service"></p>
       <h4>原因說明</h4>
       <p id="recommendation-reason"></p>
-      <h4>下一步提示</h4>
+      <h4 id="recommendation-next-step-title">下一步提示</h4>
       <p id="recommendation-next-step" class="recommendation-prompt"></p>
       <div class="recommendation-actions">
         <button type="button" id="reset-consultation">重新諮詢</button>
       </div>
-    </section>
-
-    <section id="completion-card" class="completion-card" hidden>
-      <p class="eyebrow">完成</p>
-      <h3>服務選擇完成</h3>
-      <p>已選擇：<strong id="completed-service"></strong></p>
-      <p>請將此頁面交還研究人員。</p>
     </section>
 
     {% if input_mode == "button" %}
