@@ -1,6 +1,6 @@
 from flask import Blueprint, jsonify, request
 
-from app.services.button_flow import get_button_options, get_next_question
+from app.services.button_flow import get_button_options, get_next_question, get_task_guided_prompt
 from app.services.hermes_client import get_chatbot_reply
 from app.services.prompt_builder import build_system_prompt
 
@@ -43,7 +43,12 @@ def chat_message():
     response_source = chatbot_response.get("source")
 
     if input_mode == "button" and not chatbot_response["is_final"]:
-        if not buttons and response_source == "mock" and next_question:
+        if conversation_style == "task":
+            guided = get_task_guided_prompt(history)
+            if guided:
+                reply = guided["question"]
+                buttons = guided["buttons"]
+        elif not buttons and response_source == "mock" and next_question:
             reply = next_question
             buttons = get_button_options(
                 input_mode,

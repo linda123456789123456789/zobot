@@ -1,14 +1,119 @@
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 
+from app.services.button_flow import get_task_guided_prompt
 from app.services.prompt_builder import build_model_instruction, get_turn_limit
 from app.services.service_catalog import RECOMMENDATION_RULES, SERVICE_HINTS
 
 
-MAX_BUTTON_OPTIONS = 3
+MAX_BUTTON_OPTIONS = 5
 UNCERTAIN_BUTTON_LABEL = "我不確定"
+TEMPLATE_REPLY_PATTERNS = (
+    "自然、簡潔的下一句回覆",
+    "自然, 簡潔的下一句回覆",
+)
+FREE_TEXT_NORMALIZE_MAP = {
+    "染頭髮": "染髮",
+    "染发": "染髮",
+    "染頭毛": "染髮",
+    "換髮色": "染髮",
+    "換顏色": "染髮",
+    "上色": "染髮",
+    "整頭換顏色": "全頭染",
+    "整頭都換顏色": "全頭染",
+    "整頭換色": "全頭染",
+    "整頭染": "全頭染",
+    "髮根補色": "補染",
+    "補髮根": "補染",
+    "補布丁": "補染",
+    "布丁頭": "補染",
+    "特殊色": "漂髮設計染",
+    "漂色": "漂髮設計染",
+    "漂染": "漂髮設計染",
+    "全染": "全頭染",
+    "整體燙": "整體燙髮",
+    "燙全頭": "整體燙髮",
+    "燙頭髮": "燙髮",
+    "護理": "護髮",
+    "做護髮": "護髮",
+    "修瀏海": "瀏海修剪",
+    "剪瀏海": "瀏海修剪",
+}
+
+TASK_SLOT_KEYWORDS = {
+    "direction": {
+        "染髮": ("染髮", "染髮", "染发", "上色", "換髮色", "換顏色", "髮色"),
+        "燙髮": ("燙髮", "燙头髮", "燙捲", "捲度", "燙"),
+        "護髮": ("護髮", "修護", "護理", "保養", "頭皮護理"),
+        "剪髮": ("剪髮", "修剪", "剪", "瀏海修剪"),
+    },
+    "dye_detail": {
+        "全頭染": ("全頭染", "整頭染", "整頭都染", "整頭換色", "整頭都換顏色", "全染"),
+        "補染": ("補染", "補髮根", "髮根補色", "補布丁", "布丁頭"),
+        "漂髮設計染": ("漂髮設計染", "漂髮", "漂色", "漂染", "特殊色", "耳圈染", "挑染"),
+    },
+    "target_color": {
+        "自然深色": ("自然黑", "自然深色", "深色", "黑色", "深咖"),
+        "一般棕色": ("棕色", "咖啡色", "茶色", "可可棕", "奶茶棕"),
+        "高明度特殊色": (
+            "高明度特殊色",
+            "金色",
+            "霧金",
+            "亞麻金",
+            "奶金",
+            "銀色",
+            "灰色",
+            "白金",
+            "粉色",
+            "藍色",
+            "紫色",
+            "橘色",
+            "紅色",
+        ),
+    },
+    "current_base": {
+        "自然黑髮": ("自然黑髮", "黑髮", "原生髮", "沒染過"),
+        "已染深色/中深色": ("已染深色", "染過深色", "中深色", "咖啡色底", "深棕底"),
+        "已染淺色/已漂過": ("已染淺色", "已漂過", "漂過", "淺色底", "金色底"),
+    },
+    "bleach_accept": {
+        "可接受漂髮": ("可接受漂髮", "可以漂", "可漂", "接受漂", "能漂"),
+        "希望不漂髮": ("希望不漂髮", "不想漂", "不要漂", "不漂"),
+    },
+    "brand_priority": {
+        "重視染後髮質修護": ("重視染後髮質修護", "髮質修護", "比較護髮", "髮質優先"),
+        "重視顏色表現與CP值": ("重視顏色表現與CP值", "顏色表現", "cp值", "價格優先", "預算優先"),
+    },
+    "perm_detail": {
+        "整體燙髮": ("整體燙髮", "全頭燙", "燙全頭", "燙捲"),
+        "髮根燙": ("髮根燙", "髮根蓬鬆", "頭頂扁塌"),
+        "燙瀏海": ("燙瀏海", "瀏海燙"),
+    },
+    "perm_bleached_history": {
+        "有漂過": ("有漂過", "漂過", "曾漂過"),
+        "沒有漂過": ("沒有漂過", "沒漂過", "未漂過"),
+    },
+    "treatment_detail": {
+        "護髮修護": ("護髮修護", "護髮", "修護", "柔順", "毛躁"),
+        "頭皮護理": ("頭皮護理", "頭皮", "頭皮保養"),
+    },
+    "treatment_combo": {
+        "要搭配染燙": ("搭配染燙", "一起染燙", "順便染燙"),
+        "不搭配染燙": ("不搭配染燙", "單做", "只做護髮", "不一起染燙"),
+    },
+    "cut_detail": {
+        "全頭剪髮": ("全頭剪髮", "剪短", "修短", "整體修剪"),
+        "瀏海修剪": ("瀏海修剪", "剪瀏海", "修瀏海"),
+    },
+    "restriction": {
+        "時間限制": ("趕時間", "時間不要太久", "快一點", "時間限制"),
+        "價格限制": ("不要太貴", "希望價格不要太高", "價格限制", "預算有限"),
+        "無特別限制": ("沒有特別限制", "都可以", "沒限制"),
+    },
+}
 
 
 def get_chatbot_reply(input_mode, conversation_style, message, history, system_prompt):
@@ -60,11 +165,19 @@ def _get_mock_reply(input_mode, conversation_style, message, history, system_pro
 
     user_turn_count = _count_user_turns(history)
     conversation_text = _conversation_text(history, message)
+    task_ready = _is_task_ready(
+        input_mode=input_mode,
+        conversation_style=conversation_style,
+        history=history,
+        message=message,
+    )
     allow_inferred_recommendation = _should_finish_consultation(
         input_mode,
         conversation_style,
         user_turn_count,
     )
+    if conversation_style == "task":
+        allow_inferred_recommendation = task_ready
     final_output = _build_final_output(
         conversation_text,
         allow_inferred_recommendation,
@@ -283,7 +396,7 @@ def _parse_model_json(text):
 
 
 def _normalize_model_result(result, input_mode, source):
-    reply = str(result.get("reply") or "").strip()
+    reply = _sanitize_template_reply(str(result.get("reply") or "").strip())
     is_final = bool(result.get("is_final"))
     final_output = result.get("final_output") if is_final else None
     buttons = _normalize_buttons(result.get("buttons"), input_mode, is_final)
@@ -306,15 +419,70 @@ def _normalize_model_result(result, input_mode, source):
 
 
 def _force_final_at_turn_limit(model_response, input_mode, conversation_style, message, history):
+    task_button_mode = _is_task_button_mode(input_mode, conversation_style)
+    task_mode = conversation_style == "task"
+    task_ready = _is_task_ready(
+        input_mode=input_mode,
+        conversation_style=conversation_style,
+        history=history,
+        message=message,
+    )
+    if task_mode:
+        model_response["reply"] = _guard_task_reply_if_not_ready(
+            reply=model_response.get("reply") or "",
+            ready=task_ready,
+            input_mode=input_mode,
+            history=history,
+            message=message,
+        )
+
     if model_response["is_final"]:
+        if task_mode and not task_ready:
+            return {
+                "reply": _next_task_free_text_question(_conversation_text(history, message)),
+                "buttons": model_response.get("buttons") or [],
+                "source": model_response.get("source"),
+                "is_final": False,
+                "final_output": None,
+            }
         return model_response
 
     user_turn_count = _count_user_turns(history)
+    conversation_text = _conversation_text(history, message)
+
+    if task_button_mode:
+        if task_ready:
+            final_output = (
+                _build_final_output(conversation_text, allow_inferred_recommendation=True)
+                or _build_default_final_output(conversation_text)
+            )
+            return {
+                "reply": "我已根據你的需求整理出一個參考建議，請查看下方摘要。",
+                "buttons": [],
+                "source": model_response.get("source"),
+                "is_final": True,
+                "final_output": final_output,
+            }
+
+        if user_turn_count < 12:
+            return model_response
+
+        final_output = (
+            _build_final_output(conversation_text, allow_inferred_recommendation=True)
+            or _build_default_final_output(conversation_text)
+        )
+        return {
+            "reply": "我先用目前已知條件提供保守建議，若你願意可再補充一題讓推薦更精準。",
+            "buttons": [],
+            "source": model_response.get("source"),
+            "is_final": True,
+            "final_output": final_output,
+        }
+
     turn_limit = get_turn_limit(input_mode, conversation_style)
     if user_turn_count < turn_limit:
         return model_response
 
-    conversation_text = _conversation_text(history, message)
     final_output = (
         _build_final_output(conversation_text, allow_inferred_recommendation=True)
         or _build_default_final_output(conversation_text)
@@ -391,7 +559,7 @@ def _count_user_turns(history):
         return 1
 
     user_turns = [item for item in history if item.get("role") == "user"]
-    return max(len(user_turns), 1)
+    return len(user_turns) + 1
 
 
 def _conversation_text(history, message):
@@ -410,13 +578,217 @@ def _conversation_text(history, message):
 
 
 def _should_finish_consultation(input_mode, conversation_style, user_turn_count):
-    if input_mode == "button":
-        return user_turn_count >= 3
+    turn_limit = get_turn_limit(input_mode, conversation_style)
+    return user_turn_count >= turn_limit
 
-    if conversation_style == "task":
-        return user_turn_count >= 3
 
-    return user_turn_count >= 4
+def _is_task_button_mode(input_mode, conversation_style):
+    return input_mode == "button" and conversation_style == "task"
+
+
+def _is_task_ready(input_mode, conversation_style, history, message):
+    if conversation_style != "task":
+        return False
+
+    if _is_task_button_mode(input_mode, conversation_style):
+        return get_task_guided_prompt(history) is None
+
+    conversation_text = _conversation_text(history, message)
+    return _is_task_free_text_ready(conversation_text)
+
+
+def _is_task_button_ready(input_mode, conversation_style, history):
+    if not _is_task_button_mode(input_mode, conversation_style):
+        return False
+    return get_task_guided_prompt(history) is None
+
+
+def _is_task_free_text_ready(conversation_text):
+    text = _normalize_task_free_text(conversation_text)
+    if not text:
+        return False
+
+    slots = _extract_task_free_text_slots(text)
+    direction = slots.get("direction")
+    if direction is None:
+        return False
+
+    if not slots.get("budget_range"):
+        return False
+
+    if direction == "染髮":
+        required = ("dye_detail", "target_color", "current_base", "bleach_accept", "brand_priority", "restriction")
+        return all(slots.get(field) for field in required)
+
+    if direction == "燙髮":
+        required = ("perm_detail", "perm_bleached_history", "restriction")
+        return all(slots.get(field) for field in required)
+
+    if direction == "護髮":
+        required = ("treatment_detail", "treatment_combo", "restriction")
+        return all(slots.get(field) for field in required)
+
+    if direction == "剪髮":
+        required = ("cut_detail", "restriction")
+        return all(slots.get(field) for field in required)
+
+    return False
+
+
+def _detect_direction(text):
+    normalized_text = _normalize_task_free_text(text)
+    if _has_any_phrase(normalized_text, ("染髮", "補染", "漂髮", "髮色")):
+        return "染髮"
+    if _has_any_phrase(normalized_text, ("燙髮", "捲度", "髮根燙", "燙瀏海")):
+        return "燙髮"
+    if _has_any_phrase(normalized_text, ("護髮", "頭皮護理", "修護")):
+        return "護髮"
+    if _has_any_phrase(normalized_text, ("剪髮", "瀏海修剪", "修瀏海")):
+        return "剪髮"
+    return None
+
+
+def _has_budget_info(text):
+    if _has_any_phrase(text, ("預算", "價位", "以下", "以上")):
+        return True
+    return re.search(r"\d{3,5}", text) is not None
+
+
+def _has_any_phrase(text, phrases):
+    lowered = (text or "").lower()
+    return any((phrase or "").lower() in lowered for phrase in phrases)
+
+
+def _sanitize_template_reply(reply):
+    content = (reply or "").strip()
+    if not content:
+        return content
+    if any(pattern in content for pattern in TEMPLATE_REPLY_PATTERNS):
+        return "我需要再確認一個條件，才能準確推薦。請先告訴我你的預算價位區間。"
+    return content
+
+
+def _guard_task_reply_if_not_ready(reply, ready, input_mode, history, message):
+    content = _sanitize_template_reply(reply)
+    if ready:
+        return content
+
+    if input_mode == "text":
+        return _next_task_free_text_question(_conversation_text(history, message))
+
+    if _contains_service_name(content):
+        return _next_task_free_text_question(_conversation_text(history, message))
+    return content or _next_task_free_text_question(_conversation_text(history, message))
+
+
+def _contains_service_name(text):
+    content = (text or "").strip()
+    if not content:
+        return False
+    return any(service_name in content for service_name in SERVICE_HINTS.keys())
+
+
+def _next_task_free_text_question(conversation_text):
+    text = _normalize_task_free_text(conversation_text)
+    slots = _extract_task_free_text_slots(text)
+    direction = slots.get("direction")
+    if direction is None:
+        return "你這次主要想做哪一類：染髮、燙髮、護髮還是剪髮？"
+
+    if direction == "染髮":
+        if not slots.get("dye_detail"):
+            return "你這次染髮比較接近全頭染、補染，還是漂髮設計染？"
+        if not slots.get("target_color"):
+            return "你想染後的顏色比較接近自然深色、一般棕色，還是高明度特殊色？"
+        if not slots.get("current_base"):
+            return "你目前的髮色底色是自然黑髮、已染深色/中深色，還是已染淺色/已漂過？"
+        if not slots.get("bleach_accept"):
+            return "若達到目標色可能需要漂髮，你可以接受嗎？"
+        if not slots.get("brand_priority"):
+            return "你這次更重視染後髮質修護，還是顏色表現與CP值？"
+        if not slots.get("budget_range"):
+            return "你的預算價位區間大約在哪裡？例如 1200以下、1201-1800、1801-2400、2401以上。"
+        if not slots.get("restriction"):
+            return "你是否還有時間或價格上的限制？"
+        return "收到，我會根據你的條件整理最適合的服務方案。"
+
+    if direction == "燙髮":
+        if not slots.get("perm_detail"):
+            return "你想做整體燙髮、髮根燙，還是燙瀏海？"
+        if not slots.get("perm_bleached_history"):
+            return "你有漂過頭髮嗎？"
+        if not slots.get("budget_range"):
+            return "你的預算價位區間大約在哪裡？例如 1200以下、1201-1800、1801-2400、2401以上。"
+        if not slots.get("restriction"):
+            return "你是否還有時間或價格上的限制？"
+        return "收到，我會根據你的條件整理最適合的服務方案。"
+
+    if direction == "護髮":
+        if not slots.get("treatment_detail"):
+            return "你這次比較想做護髮修護，還是頭皮護理？"
+        if not slots.get("treatment_combo"):
+            return "這次會搭配染燙一起做，還是單做護髮？"
+        if not slots.get("budget_range"):
+            return "你的預算價位區間大約在哪裡？例如 1200以下、1201-1800。"
+        if not slots.get("restriction"):
+            return "你是否還有時間或價格上的限制？"
+        return "收到，我會根據你的條件整理最適合的服務方案。"
+
+    if direction == "剪髮":
+        if not slots.get("cut_detail"):
+            return "你這次是全頭剪髮，還是瀏海修剪？"
+        if not slots.get("budget_range"):
+            return "你的預算價位區間大約在哪裡？例如 1200以下、1201-1800。"
+        if not slots.get("restriction"):
+            return "你是否還有時間上的限制？"
+        return "收到，我會根據你的條件整理最適合的服務方案。"
+
+    return "我需要再確認一個條件，才能準確推薦。你目前最在意的是預算、時間，還是髮況限制？"
+
+
+def _normalize_task_free_text(text):
+    normalized = (text or "").strip()
+    if not normalized:
+        return normalized
+
+    lowered = normalized.lower()
+    for raw, canonical in FREE_TEXT_NORMALIZE_MAP.items():
+        lowered = lowered.replace(raw.lower(), canonical)
+
+    return lowered
+
+
+def _extract_task_free_text_slots(text):
+    normalized = _normalize_task_free_text(text)
+    slots = {"budget_range": _detect_budget_range(normalized)}
+
+    for slot_key, candidates in TASK_SLOT_KEYWORDS.items():
+        slots[slot_key] = _detect_slot_value(normalized, candidates)
+
+    return slots
+
+
+def _detect_slot_value(text, candidates):
+    for canonical, keywords in candidates.items():
+        if _has_any_phrase(text, keywords):
+            return canonical
+    return None
+
+
+def _detect_budget_range(text):
+    if not _has_budget_info(text):
+        return None
+
+    if _has_any_phrase(text, ("1200以下", "1200 以下", "千二以下")):
+        return "1200以下"
+    if _has_any_phrase(text, ("1201-1800", "1201 到 1800", "1201~1800")):
+        return "1201-1800"
+    if _has_any_phrase(text, ("1801-2400", "1801 到 2400", "1801~2400")):
+        return "1801-2400"
+    if _has_any_phrase(text, ("2401以上", "2401 以上", "2500以上", "三千以下")):
+        return "2401以上"
+
+    return "已提供預算"
 
 
 def _build_final_output(conversation_text, allow_inferred_recommendation):

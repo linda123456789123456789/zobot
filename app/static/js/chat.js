@@ -19,7 +19,7 @@
   const resetConsultationEl = document.querySelector("#reset-consultation");
   const serviceChoiceButtons = Array.from(document.querySelectorAll("[data-service-choice]"));
   const initialGreeting = shell.dataset.initialGreeting;
-  const maxButtonOptions = 3;
+  const maxButtonOptions = 5;
   let isWaitingForReply = false;
   let waitingMessageEl = null;
   const initialButtonLabels = buttonOptionsEl
