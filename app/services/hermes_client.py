@@ -51,13 +51,15 @@ FREE_TEXT_NORMALIZE_MAP = {
     "燙頭髮": "燙髮",
     "護理": "護髮",
     "做護髮": "護髮",
+    "護髮修護": "受損修護",
+    "頭皮護理": "日常保養",
 }
 
 TASK_SLOT_KEYWORDS = {
     "direction": {
         "染髮": ("染髮", "染髮", "染发", "上色", "換髮色", "換顏色", "髮色"),
         "燙髮": ("燙髮", "燙头髮", "燙捲", "捲度", "燙"),
-        "護髮": ("護髮", "修護", "護理", "保養", "頭皮護理"),
+        "護髮": ("護髮", "修護", "護理", "保養"),
     },
     "dye_detail": {
         "全頭染": ("全頭染", "整頭染", "整頭都染", "整頭換色", "整頭都換顏色", "全染"),
@@ -107,12 +109,9 @@ TASK_SLOT_KEYWORDS = {
         "沒有漂過": ("沒有漂過", "沒漂過", "未漂過"),
     },
     "treatment_detail": {
-        "護髮修護": ("護髮修護", "護髮", "修護", "柔順", "毛躁"),
-        "頭皮護理": ("頭皮護理", "頭皮", "頭皮保養"),
-    },
-    "treatment_combo": {
-        "要搭配染燙": ("搭配染燙", "一起染燙", "順便染燙"),
-        "不搭配染燙": ("不搭配染燙", "單做", "只做護髮", "不一起染燙"),
+        "受損修護": ("受損修護", "護髮修護", "深層修護", "染燙受損", "髮尾毛裂", "髮尾乾燥", "受損"),
+        "柔順抗毛躁": ("柔順抗毛躁", "柔順", "毛躁", "打結", "觸感"),
+        "日常保養": ("日常保養", "入門護髮", "基礎修護", "光澤", "保養"),
     },
     "restriction": {
         "時間限制": ("趕時間", "時間不要太久", "快一點", "時間限制"),
@@ -129,8 +128,7 @@ TASK_SLOT_ENUMS = {
     "brand_priority": ("重視染後髮質修護", "重視顏色表現與CP值"),
     "perm_detail": ("整體燙髮", "髮根燙", "燙瀏海"),
     "perm_bleached_history": ("有漂過", "沒有漂過"),
-    "treatment_detail": ("護髮修護", "頭皮護理"),
-    "treatment_combo": ("要搭配染燙", "不搭配染燙"),
+    "treatment_detail": ("受損修護", "柔順抗毛躁", "日常保養"),
     "restriction": ("時間限制", "價格限制", "無特別限制"),
 }
 
@@ -733,7 +731,7 @@ def _is_task_free_text_ready(conversation_text):
         return all(slots.get(field) for field in required) and _has_budget_compatible_candidates(slots, text)
 
     if direction == "護髮":
-        required = ("treatment_detail", "treatment_combo", "restriction")
+        required = ("treatment_detail", "restriction")
         return all(slots.get(field) for field in required) and _has_budget_compatible_candidates(slots, text)
 
     return False
@@ -745,7 +743,7 @@ def _detect_direction(text):
         return "染髮"
     if _has_any_phrase(normalized_text, ("燙髮", "捲度", "髮根燙", "燙瀏海")):
         return "燙髮"
-    if _has_any_phrase(normalized_text, ("護髮", "頭皮護理", "修護")):
+    if _has_any_phrase(normalized_text, ("護髮", "修護")):
         return "護髮"
     return None
 
@@ -831,9 +829,7 @@ def _next_task_free_text_question(conversation_text):
 
     if direction == "護髮":
         if not slots.get("treatment_detail"):
-            return "你這次比較想做護髮修護，還是頭皮護理？"
-        if not slots.get("treatment_combo"):
-            return "這次會搭配染燙一起做，還是單做護髮？"
+            return "你這次最想改善哪種髮絲狀況：受損修護、柔順抗毛躁，還是日常保養？"
         if not slots.get("budget_range"):
             return "你的預算價位區間大約在哪裡？例如 1200以下、1201-1800。"
         if not slots.get("restriction"):
@@ -920,8 +916,7 @@ def _extract_task_slots_with_llm(normalized_text):
         "brand_priority: 重視染後髮質修護|重視顏色表現與CP值|null\n"
         "perm_detail: 整體燙髮|髮根燙|燙瀏海|null\n"
         "perm_bleached_history: 有漂過|沒有漂過|null\n"
-        "treatment_detail: 護髮修護|頭皮護理|null\n"
-        "treatment_combo: 要搭配染燙|不搭配染燙|null\n"
+        "treatment_detail: 受損修護|柔順抗毛躁|日常保養|null\n"
         "restriction: 時間限制|價格限制|無特別限制|null\n"
         "budget_range: 1200以下|1201-1800|1801-2400|2401以上|已提供預算|null"
     )
@@ -1120,6 +1115,51 @@ def _service_names_by_category_index(index):
     return [service.get("name") for service in SERVICE_CATEGORIES[index].get("services", []) if service.get("name")]
 
 
+def _rank_treatment_services_by_preference(slots, treatment_services):
+    if not treatment_services:
+        return []
+
+    scores = {service_name: 0 for service_name in treatment_services}
+    detail = slots.get("treatment_detail")
+    detail_values = TASK_SLOT_ENUMS.get("treatment_detail", ())
+
+    if len(detail_values) >= 3:
+        # Soft preference: the selected concern is weighted highest, but others keep a chance.
+        if detail == detail_values[0]:  # 受損修護
+            bonus_map = {0: 3, 1: 2, 2: 1}
+        elif detail == detail_values[1]:  # 柔順抗毛躁
+            bonus_map = {1: 3, 0: 2, 2: 2}
+        elif detail == detail_values[2]:  # 日常保養
+            bonus_map = {2: 3, 1: 2, 0: 1}
+        else:
+            bonus_map = {}
+
+        for index, bonus in bonus_map.items():
+            if index < len(treatment_services):
+                scores[treatment_services[index]] += bonus
+
+    restriction = slots.get("restriction")
+    restriction_values = TASK_SLOT_ENUMS.get("restriction", ())
+    if len(restriction_values) >= 2 and restriction == restriction_values[1]:
+        # Price-sensitive users: prioritize lower price bands.
+        sorted_by_price = sorted(
+            treatment_services,
+            key=lambda name: SERVICE_PRICE_BOUNDS.get(name, {"min": 999999})["min"],
+        )
+        bonus = len(sorted_by_price)
+        for service_name in sorted_by_price:
+            scores[service_name] += bonus
+            bonus -= 1
+    elif len(restriction_values) >= 1 and restriction == restriction_values[0]:
+        # Time-sensitive users: bias toward lighter maintenance tracks.
+        if len(treatment_services) >= 3:
+            scores[treatment_services[2]] += 2
+            scores[treatment_services[1]] += 1
+
+    stable_order = {name: index for index, name in enumerate(treatment_services)}
+    return sorted(treatment_services, key=lambda name: (-scores.get(name, 0), stable_order.get(name, 999)))
+
+
 def _candidate_services_for_task_slots(slots):
     direction = slots.get("direction")
     direction_values = TASK_SLOT_ENUMS.get("direction", ())
@@ -1188,16 +1228,7 @@ def _candidate_services_for_task_slots(slots):
         if len(treatment_services) < 3:
             return treatment_services
 
-        detail = slots.get("treatment_detail")
-        combo = slots.get("treatment_combo")
-        detail_values = TASK_SLOT_ENUMS.get("treatment_detail", ())
-        combo_values = TASK_SLOT_ENUMS.get("treatment_combo", ())
-
-        if len(detail_values) >= 2 and detail == detail_values[1]:
-            return [treatment_services[2]]
-        if len(combo_values) >= 1 and combo == combo_values[0]:
-            return [treatment_services[0], treatment_services[1], treatment_services[2]]
-        return [treatment_services[1], treatment_services[0], treatment_services[2]]
+        return _rank_treatment_services_by_preference(slots, treatment_services)
 
     return []
 

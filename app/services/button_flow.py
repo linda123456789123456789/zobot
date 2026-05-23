@@ -14,7 +14,7 @@ TASK_LED_STEPS = [
     },
     {
         "question": "如果還不確定，請選擇最接近你的目標。",
-        "buttons": ["改變髮色", "改變髮型", "改善髮質頭皮", UNCERTAIN],
+        "buttons": ["改變髮色", "改變髮型", "改善髮質", UNCERTAIN],
     },
     {
         "question": "請選擇服務細項。",
@@ -113,7 +113,7 @@ def get_task_guided_prompt(history):
         if _is_uncertain(user_messages[0]):
             return {
                 "question": "請選擇最接近你的情況。",
-                "buttons": ["改變髮色", "改變髮型", "改善髮質頭皮", UNCERTAIN],
+                "buttons": ["改變髮色", "改變髮型", "改善髮質", UNCERTAIN],
             }
         return _detail_question_for_direction(direction)
 
@@ -133,13 +133,11 @@ def _detail_question_for_direction(direction):
     if direction == "燙髮":
         return {"question": "請選擇你想做的燙髮類型。", "buttons": ["整體燙髮", "髮根燙", "燙瀏海", UNCERTAIN]}
     if direction == "護髮":
-        return {"question": "請選擇你想做的護理類型。", "buttons": ["護髮修護", "頭皮護理", UNCERTAIN]}
+        return {"question": "請選擇你目前最想改善的髮絲狀況。", "buttons": ["受損修護", "柔順抗毛躁", "日常保養", UNCERTAIN]}
     if direction == "補染":
         return {"question": "請確認你想做的服務細項。", "buttons": ["髮根補染", "全頭換色", UNCERTAIN]}
     if direction == "漂髮":
         return {"question": "請確認你想做的漂髮方向。", "buttons": ["一般漂髮", "特殊色設計染", UNCERTAIN]}
-    if direction == "組合服務":
-        return {"question": "請選擇你偏好的組合方向。", "buttons": ["染髮＋護髮", "燙髮＋護髮", UNCERTAIN]}
     return {"question": "請選擇你想做的服務細項。", "buttons": ["染髮", "燙髮", "護髮", UNCERTAIN]}
 
 
@@ -153,11 +151,6 @@ def _requirement_question_for_direction(direction):
         return {
             "question": "你有漂過頭髮嗎？",
             "buttons": ["有漂過", "沒有漂過", UNCERTAIN],
-        }
-    if direction in {"護髮", "頭皮護理"}:
-        return {
-            "question": "這次會搭配染燙一起做嗎？",
-            "buttons": ["要搭配染燙", "不搭配染燙", UNCERTAIN],
         }
     return {"question": "請選擇你的預算價位範圍。", "buttons": _budget_range_options_for(direction, [])}
 
@@ -201,12 +194,7 @@ def _next_requirement_question(direction, user_messages):
             return {"question": "請選擇你的預算價位範圍。", "buttons": _budget_range_options_for(direction, user_messages)}
         return None
 
-    if direction in {"護髮", "頭皮護理"}:
-        if not _has_any(user_messages, {"要搭配染燙", "不搭配染燙", UNCERTAIN}):
-            return {
-                "question": "這次會搭配染燙一起做嗎？",
-                "buttons": ["要搭配染燙", "不搭配染燙", UNCERTAIN],
-            }
+    if direction == "護髮":
         if not _has_budget_range(user_messages):
             return {"question": "請選擇你的預算價位範圍。", "buttons": _budget_range_options_for(direction, user_messages)}
         return None
@@ -269,7 +257,9 @@ def _budget_range_options_for(direction, user_messages):
             return ["1201-1800", "1801-2400", "2401 以上", UNCERTAIN]
         return ["1200 以下", "1201-1800", "1801-2400", "2401 以上", UNCERTAIN]
 
-    if direction in {"護髮", "頭皮護理"}:
+    if direction == "護髮":
+        if detail == "受損修護":
+            return ["1201-1800", UNCERTAIN]
         return ["1200 以下", "1201-1800", UNCERTAIN]
 
     return DEFAULT_BUDGET_RANGE_OPTIONS
@@ -290,8 +280,8 @@ def _resolve_detail(direction, user_messages):
                 return option
         return None
 
-    if direction in {"護髮", "頭皮護理"}:
-        for option in ("護髮修護", "頭皮護理"):
+    if direction == "護髮":
+        for option in ("受損修護", "柔順抗毛躁", "日常保養"):
             if option in labels:
                 return option
         return None
@@ -326,7 +316,7 @@ def _resolve_direction(user_messages):
         return None
 
     first = user_messages[0]
-    direct_map = {"染髮", "補染", "漂髮", "燙髮", "護髮", "頭皮護理", "組合服務"}
+    direct_map = {"染髮", "補染", "漂髮", "燙髮", "護髮"}
     if first in direct_map:
         return first
 
@@ -336,7 +326,7 @@ def _resolve_direction(user_messages):
             return "染髮"
         if classifier == "改變髮型":
             return "燙髮"
-        if classifier == "改善髮質頭皮":
+        if classifier == "改善髮質":
             return "護髮"
     return None
 

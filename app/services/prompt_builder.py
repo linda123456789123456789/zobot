@@ -255,8 +255,8 @@ def _task_button_step_instruction(current_turn):
     if current_turn <= 1:
         return (
             "task+button Step 1：詢問服務方向。"
-            "選項可用：染髮、補染、漂髮、燙髮、護髮、頭皮護理、組合服務。\n"
-            "若使用者選不確定，下一輪改問分類題（改變髮色 / 改變髮型 / 改善髮質頭皮）。\n"
+            "選項可用：染髮、護髮、燙髮。\n"
+            "若使用者選不確定，下一輪改問分類題（改變髮色 / 改變髮型 / 改善髮質）。\n"
         )
     if current_turn == 2:
         return (
@@ -268,7 +268,7 @@ def _task_button_step_instruction(current_turn):
             "task+button Step 3：詢問必要條件（依方向分支）。\n"
             "- 染髮：目標色系 / 目前底色 /（必要時）可否漂髮 / 預算。\n"
             "- 燙髮：是否漂過 / 是否懷孕 / 預算。\n"
-            "- 護髮：預算 / 是否搭配染燙。\n"
+            "- 護髮：先問髮絲需求細項（受損修護/柔順抗毛躁/日常保養），再問預算。\n"
         )
     if current_turn == 4:
         return (
@@ -288,7 +288,7 @@ def _phase_instruction(input_mode, conversation_style, current_turn):
     if conversation_style == "task":
         if current_turn <= 2:
             return (
-                "本輪 task-led 要求：先確認服務方向（染髮/補染/漂髮/燙髮/護髮/頭皮/組合）。"
+                "本輪 task-led 要求：先確認服務方向（染髮/補染/漂髮/燙髮/護髮）。"
                 "只問一個能直接推進決策的封閉式問題。\n"
             )
         if current_turn <= 3:
