@@ -16,6 +16,7 @@ TEMPLATE_REPLY_PATTERNS = (
     "自然、簡潔的下一句回覆",
     "自然, 簡潔的下一句回覆",
 )
+ONSITE_EVALUATION_NOTE = "實際可行性、藥劑選擇與髮況風險仍需以現場髮型師評估為準。"
 
 
 def _debug_enabled():
@@ -42,7 +43,6 @@ FREE_TEXT_NORMALIZE_MAP = {
     "補髮根": "補染",
     "補布丁": "補染",
     "布丁頭": "補染",
-    "特殊色": "漂髮設計染",
     "漂色": "漂髮設計染",
     "漂染": "漂髮設計染",
     "全染": "全頭染",
@@ -81,6 +81,7 @@ TASK_SLOT_KEYWORDS = {
             "紫色",
             "橘色",
             "紅色",
+            "特殊色",
         ),
     },
     "current_base": {
@@ -215,10 +216,14 @@ def _get_mock_reply(input_mode, conversation_style, message, history, system_pro
     )
     if conversation_style == "task":
         allow_inferred_recommendation = task_ready
-    final_output = _build_final_output(
-        conversation_text,
-        allow_inferred_recommendation,
-    )
+    final_output = None
+    if conversation_style == "task" and allow_inferred_recommendation:
+        final_output = _build_task_text_final_output(conversation_text)
+    if not final_output:
+        final_output = _build_final_output(
+            conversation_text,
+            allow_inferred_recommendation,
+        )
 
     if not final_output and allow_inferred_recommendation:
         final_output = _build_default_final_output(conversation_text)
@@ -517,6 +522,24 @@ def _force_final_at_turn_limit(model_response, input_mode, conversation_style, m
                 "is_final": False,
                 "final_output": None,
             }
+        if task_button_mode and task_ready:
+            conversation_text = _conversation_text(history, message)
+            final_output = _build_task_text_final_output(conversation_text)
+            if final_output:
+                return {
+                    "reply": "我已根據你的需求整理出一個參考建議，請查看下方摘要。",
+                    "buttons": [],
+                    "source": model_response.get("source"),
+                    "is_final": True,
+                    "final_output": final_output,
+                }
+            return {
+                "reply": _next_task_free_text_question(conversation_text),
+                "buttons": model_response.get("buttons") or [],
+                "source": model_response.get("source"),
+                "is_final": False,
+                "final_output": None,
+            }
         return model_response
 
     user_turn_count = _count_user_turns(history)
@@ -543,10 +566,7 @@ def _force_final_at_turn_limit(model_response, input_mode, conversation_style, m
 
     if task_button_mode:
         if task_ready:
-            final_output = (
-                _build_final_output(conversation_text, allow_inferred_recommendation=True)
-                or _build_default_final_output(conversation_text)
-            )
+            final_output = _build_task_text_final_output(conversation_text) or _build_default_final_output(conversation_text)
             return {
                 "reply": "我已根據你的需求整理出一個參考建議，請查看下方摘要。",
                 "buttons": [],
@@ -558,10 +578,7 @@ def _force_final_at_turn_limit(model_response, input_mode, conversation_style, m
         if user_turn_count < 12:
             return model_response
 
-        final_output = (
-            _build_final_output(conversation_text, allow_inferred_recommendation=True)
-            or _build_default_final_output(conversation_text)
-        )
+        final_output = _build_task_text_final_output(conversation_text) or _build_default_final_output(conversation_text)
         return {
             "reply": "我先用目前已知條件提供保守建議，若你願意可再補充一題讓推薦更精準。",
             "buttons": [],
@@ -622,7 +639,7 @@ def _normalize_final_output(final_output):
     return {
         "recommended_service": service_name,
         "reason": str(final_output.get("reason") or SERVICE_HINTS[service_name]["reason"]),
-        "next_step": "請參考此建議，並從左側服務內容中選擇你最想預約的方案。",
+        "next_step": f"請參考此建議，並從左側服務內容中選擇你最想預約的方案。{ONSITE_EVALUATION_NOTE}",
     }
 
 
@@ -971,6 +988,9 @@ def _validate_task_slot_payload(parsed):
 
 
 def _detect_slot_value(text, candidates):
+    for canonical in candidates.keys():
+        if canonical and canonical in text:
+            return canonical
     for canonical, keywords in candidates.items():
         if _has_any_phrase(text, keywords):
             return canonical
@@ -1182,6 +1202,13 @@ def _candidate_services_for_task_slots(slots):
     return []
 
 
+def _has_no_bleach_constraint(slots, normalized_text):
+    if slots.get("bleach_accept") == "希望不漂髮":
+        return True
+    no_bleach_phrases = TASK_SLOT_KEYWORDS.get("bleach_accept", {}).get("希望不漂髮", ())
+    return _has_any_phrase(normalized_text, no_bleach_phrases)
+
+
 def _has_budget_compatible_candidates(slots, normalized_text):
     budget_range = slots.get("budget_range")
     if not budget_range:
@@ -1199,22 +1226,32 @@ def _build_task_text_final_output(conversation_text):
         return None
 
     slots = _extract_task_slots(normalized_text)
-    candidates = _candidate_services_for_task_slots(slots)
-    if not candidates:
+    if _has_no_bleach_constraint(slots, normalized_text):
+        slots["bleach_accept"] = "希望不漂髮"
+    ranked_candidates = _candidate_services_for_task_slots(slots)
+    if not ranked_candidates:
         return None
 
-    filtered = _filter_services_by_budget(candidates, slots.get("budget_range"), normalized_text)
+    filtered = _filter_services_by_budget(ranked_candidates, slots.get("budget_range"), normalized_text)
     if not filtered:
         return None
 
     service_name = filtered[0]
     if service_name not in SERVICE_HINTS:
         return None
-    return _final_output_for(service_name)
+    reason = _build_task_recommendation_reason(service_name, slots, normalized_text, ranked_candidates=filtered)
+    return _final_output_for(service_name, reason=reason)
 
 
 def _build_final_output(conversation_text, allow_inferred_recommendation):
+    normalized_text = _normalize_task_free_text(conversation_text)
+    no_bleach_requested = _has_any_phrase(
+        normalized_text,
+        TASK_SLOT_KEYWORDS.get("bleach_accept", {}).get("希望不漂髮", ()),
+    )
     for service_name, details in SERVICE_HINTS.items():
+        if service_name == "漂髮" and no_bleach_requested:
+            continue
         if service_name in conversation_text:
             return _final_output_for(service_name)
 
@@ -1222,26 +1259,178 @@ def _build_final_output(conversation_text, allow_inferred_recommendation):
         return None
 
     for service_name, keywords in RECOMMENDATION_RULES:
+        if service_name == "漂髮" and no_bleach_requested:
+            continue
         if any(keyword in conversation_text for keyword in keywords):
             return _final_output_for(service_name)
 
     return None
 
 
-def _final_output_for(service_name):
+def _build_task_recommendation_reason(service_name, slots, normalized_text, ranked_candidates=None):
+    if not isinstance(slots, dict):
+        return SERVICE_HINTS[service_name]["reason"]
+
+    conflict_text = _build_conflict_inference(slots, normalized_text)
+    fit_text = _build_fit_inference(service_name, slots)
+    comparison_text = _build_comparison_inference(service_name, slots, ranked_candidates)
+    boundary_text = _build_boundary_inference(service_name, slots, normalized_text)
+
+    parts = []
+    if conflict_text:
+        parts.append(conflict_text)
+    parts.append(fit_text)
+    if comparison_text:
+        parts.append(comparison_text)
+    if boundary_text:
+        parts.append(boundary_text)
+    parts.append(ONSITE_EVALUATION_NOTE)
+    return "".join(parts)
+
+
+def _profile_value(service_name, field):
+    details = SERVICE_HINTS.get(service_name, {})
+    profile = details.get("profile") if isinstance(details, dict) else {}
+    if not isinstance(profile, dict):
+        return ""
+    return str(profile.get(field) or "").strip()
+
+
+def _first_sentence(text):
+    content = str(text or "").strip()
+    if not content:
+        return ""
+    for delimiter in ("。", "；"):
+        if delimiter in content:
+            return content.split(delimiter)[0].strip()
+    return content
+
+
+def _build_conflict_inference(slots, normalized_text):
+    direction = slots.get("direction")
+    if direction == "染髮":
+        if slots.get("target_color") == "高明度特殊色" and _has_no_bleach_constraint(slots, normalized_text):
+            return "你想要高明度特殊色，但同時明確希望不漂髮，這兩個條件在技術上會互相牽制。"
+    if direction == "燙髮" and slots.get("perm_bleached_history") == "有漂過":
+        return "你有漂髮歷史且希望燙髮，這類情境通常要更保守評估藥劑與受損風險。"
+    return ""
+
+
+def _build_fit_inference(service_name, slots):
+    direction = slots.get("direction")
+    strong_point = _first_sentence(_profile_value(service_name, "效果強項"))
+    difference = _first_sentence(_profile_value(service_name, "與同類服務差異"))
+    tradeoff = _first_sentence(_profile_value(service_name, "代價或取捨"))
+    emphasis = slots.get("brand_priority")
+    budget = slots.get("budget_range")
+
+    if direction == "染髮":
+        rationale_bits = []
+        if emphasis:
+            rationale_bits.append(f"你目前偏好是「{emphasis}」")
+        if budget:
+            rationale_bits.append(f"預算為「{budget}」")
+        if slots.get("bleach_accept") == "希望不漂髮":
+            rationale_bits.append("且有不漂髮的前提")
+        basis = "、".join(rationale_bits) if rationale_bits else "你目前提供的條件"
+        feature_text = strong_point or difference or SERVICE_HINTS[service_name]["reason"]
+        return f"基於{basis}，推薦「{service_name}」；此方案的核心優勢是{feature_text}。"
+
+    if direction == "燙髮":
+        feature_text = strong_point or difference or SERVICE_HINTS[service_name]["reason"]
+        return f"考量你的燙髮條件，推薦「{service_name}」，重點是{feature_text}。"
+
+    if direction == "護髮":
+        feature_text = strong_point or difference or SERVICE_HINTS[service_name]["reason"]
+        return f"依照你的護髮需求，推薦「{service_name}」，主要原因是{feature_text}。"
+
+    if tradeoff:
+        return f"推薦「{service_name}」，整體較符合你目前需求；同時需注意{tradeoff}。"
+    return f"推薦「{service_name}」，整體較符合你目前需求。"
+
+
+def _comparison_pool_by_direction(direction):
+    if direction == "染髮":
+        return ["日本資生堂染髮", "日本哥德式染髮", "補染", "漂髮"]
+    if direction == "燙髮":
+        return ["日本資生堂燙髮", "日本哥德式燙髮", "髮根燙", "燙瀏海"]
+    if direction == "護髮":
+        return ["哥德式護髮", "哥德式可洛娜三劑式護髮", "鉑金修護"]
+    return []
+
+
+def _pick_comparison_target(service_name, slots, ranked_candidates):
+    candidates = ranked_candidates if isinstance(ranked_candidates, list) else []
+    for item in candidates:
+        if item and item != service_name:
+            return item
+
+    for item in _comparison_pool_by_direction(slots.get("direction")):
+        if item and item != service_name:
+            return item
+    return ""
+
+
+def _build_comparison_inference(service_name, slots, ranked_candidates):
+    target = _pick_comparison_target(service_name, slots, ranked_candidates)
+    if not target:
+        return ""
+
+    difference = _first_sentence(_profile_value(service_name, "與同類服務差異"))
+    if difference and target in difference:
+        if difference.startswith("相較於"):
+            return f"{difference}。"
+        return f"相較於「{target}」，{difference}。"
+
+    direction = slots.get("direction")
+    if direction == "染髮":
+        if target == "漂髮" and slots.get("bleach_accept") == "希望不漂髮":
+            return "相較於「漂髮」，這個方案可保留不漂髮前提並降低化學負擔。"
+        if slots.get("brand_priority") == "重視顏色表現與CP值" and service_name == "日本資生堂染髮":
+            return f"相較於「{target}」，此方案更貼近你優先的顏色表現與CP值。"
+        if slots.get("brand_priority") == "重視染後髮質修護" and service_name == "日本哥德式染髮":
+            return f"相較於「{target}」，此方案把染後髮質修護放在更前面。"
+    return f"相較於「{target}」，這個方案與你目前條件的匹配度更高。"
+
+
+def _build_boundary_inference(service_name, slots, normalized_text):
+    direction = slots.get("direction")
+    not_fit = _first_sentence(_profile_value(service_name, "不適合或限制"))
+    tradeoff = _first_sentence(_profile_value(service_name, "代價或取捨"))
+
+    if direction == "染髮":
+        if slots.get("target_color") == "高明度特殊色" and _has_no_bleach_constraint(slots, normalized_text):
+            return "在不漂髮條件下，明度與通透感會較保守，與理想特殊色仍可能有落差。"
+        if slots.get("target_color") == "高明度特殊色" and slots.get("bleach_accept") == "可接受漂髮":
+            return "若要追求更高明度，後續退色速度與護髮成本通常會提高。"
+
+    if tradeoff:
+        return f"需要留意的是，{tradeoff}。"
+    if not_fit:
+        return f"限制面向上，{not_fit}。"
+    return ""
+
+
+def _final_output_for(service_name, reason=None):
+    resolved_reason = str(reason).strip() if reason else SERVICE_HINTS[service_name]["reason"]
     return {
         "recommended_service": service_name,
-        "reason": SERVICE_HINTS[service_name]["reason"],
-        "next_step": "請參考此建議，並從左側服務內容中選擇你最想預約的方案。",
+        "reason": resolved_reason,
+        "next_step": f"請參考此建議，並從左側服務內容中選擇你最想預約的方案。{ONSITE_EVALUATION_NOTE}",
     }
 
 
 def _build_default_final_output(conversation_text):
+    normalized_text = _normalize_task_free_text(conversation_text)
+    no_bleach_requested = _has_any_phrase(
+        normalized_text,
+        TASK_SLOT_KEYWORDS.get("bleach_accept", {}).get("希望不漂髮", ()),
+    )
     if "染後" in conversation_text or "染髮又在意髮質" in conversation_text:
         service_name = "日本哥德式染髮"
     elif "補染" in conversation_text or "補髮根" in conversation_text:
         service_name = "補染"
-    elif "漂" in conversation_text or "淺色" in conversation_text or "特殊髮色" in conversation_text:
+    elif ("漂" in conversation_text or "淺色" in conversation_text or "特殊髮色" in conversation_text) and not no_bleach_requested:
         service_name = "漂髮"
     elif "瀏海" in conversation_text:
         service_name = "燙瀏海"
