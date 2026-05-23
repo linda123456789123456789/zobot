@@ -10,11 +10,11 @@ COLOR_BRAND_PRIORITY_OPTIONS = ["重視染後髮質修護", "重視顏色表現�
 TASK_LED_STEPS = [
     {
         "question": "請選擇你這次想預約的美髮服務方向。",
-        "buttons": ["染髮", "護髮", "燙髮", "剪髮", UNCERTAIN],
+        "buttons": ["染髮", "護髮", "燙髮", UNCERTAIN],
     },
     {
         "question": "如果還不確定，請選擇最接近你的目標。",
-        "buttons": ["改變髮色", "改變髮型", "改善髮質頭皮", "修整", UNCERTAIN],
+        "buttons": ["改變髮色", "改變髮型", "改善髮質頭皮", UNCERTAIN],
     },
     {
         "question": "請選擇服務細項。",
@@ -98,7 +98,7 @@ def get_task_guided_prompt(history):
     if turn <= 0:
         return {
             "question": "請選擇你這次想預約的美髮服務方向。",
-            "buttons": ["染髮", "護髮", "燙髮", "剪髮", UNCERTAIN],
+            "buttons": ["染髮", "護髮", "燙髮", UNCERTAIN],
         }
 
     direction = _resolve_direction(user_messages)
@@ -113,7 +113,7 @@ def get_task_guided_prompt(history):
         if _is_uncertain(user_messages[0]):
             return {
                 "question": "請選擇最接近你的情況。",
-                "buttons": ["改變髮色", "改變髮型", "改善髮質頭皮", "修整", UNCERTAIN],
+                "buttons": ["改變髮色", "改變髮型", "改善髮質頭皮", UNCERTAIN],
             }
         return _detail_question_for_direction(direction)
 
@@ -128,8 +128,6 @@ def get_task_guided_prompt(history):
 
 
 def _detail_question_for_direction(direction):
-    if direction == "剪髮":
-        return {"question": "請選擇你想做的剪髮類型。", "buttons": ["全頭剪髮", "瀏海修剪", UNCERTAIN]}
     if direction == "染髮":
         return {"question": "請選擇你想做的染髮類型。", "buttons": ["全頭染", "補染", "漂髮設計染", UNCERTAIN]}
     if direction == "燙髮":
@@ -141,8 +139,8 @@ def _detail_question_for_direction(direction):
     if direction == "漂髮":
         return {"question": "請確認你想做的漂髮方向。", "buttons": ["一般漂髮", "特殊色設計染", UNCERTAIN]}
     if direction == "組合服務":
-        return {"question": "請選擇你偏好的組合方向。", "buttons": ["染髮＋護髮", "燙髮＋護髮", "剪髮＋護髮", UNCERTAIN]}
-    return {"question": "請選擇你想做的服務細項。", "buttons": ["染髮", "燙髮", "護髮", "剪髮", UNCERTAIN]}
+        return {"question": "請選擇你偏好的組合方向。", "buttons": ["染髮＋護髮", "燙髮＋護髮", UNCERTAIN]}
+    return {"question": "請選擇你想做的服務細項。", "buttons": ["染髮", "燙髮", "護髮", UNCERTAIN]}
 
 
 def _requirement_question_for_direction(direction):
@@ -161,20 +159,10 @@ def _requirement_question_for_direction(direction):
             "question": "這次會搭配染燙一起做嗎？",
             "buttons": ["要搭配染燙", "不搭配染燙", UNCERTAIN],
         }
-    if direction == "剪髮":
-        return {
-            "question": "請選擇你想做的剪髮範圍。",
-            "buttons": ["全頭剪髮", "瀏海修剪", UNCERTAIN],
-        }
     return {"question": "請選擇你的預算價位範圍。", "buttons": _budget_range_options_for(direction, [])}
 
 
 def _restriction_question_for_direction(direction):
-    if direction == "剪髮":
-        return {
-            "question": "請選擇是否有以下限制。",
-            "buttons": ["希望時間不要太久", "希望價格不要太高", "沒有特別限制", UNCERTAIN],
-        }
     return {
         "question": "請選擇是否有以下限制。",
         "buttons": ["不想漂髮", "希望時間不要太久", "希望價格不要太高", "沒有特別限制", UNCERTAIN],
@@ -223,21 +211,13 @@ def _next_requirement_question(direction, user_messages):
             return {"question": "請選擇你的預算價位範圍。", "buttons": _budget_range_options_for(direction, user_messages)}
         return None
 
-    if direction == "剪髮":
-        if not _has_any(user_messages, {"全頭剪髮", "瀏海修剪", UNCERTAIN}):
-            return {"question": "請選擇你想做的剪髮範圍。", "buttons": ["全頭剪髮", "瀏海修剪", UNCERTAIN]}
-        return None
-
     if not _has_budget_range(user_messages):
         return {"question": "請選擇你的預算價位範圍。", "buttons": _budget_range_options_for(direction, user_messages)}
     return None
 
 
 def _has_restriction_answer(user_messages, direction):
-    if direction == "剪髮":
-        candidates = {"希望時間不要太久", "希望價格不要太高", "沒有特別限制", UNCERTAIN}
-    else:
-        candidates = {"不想漂髮", "希望時間不要太久", "希望價格不要太高", "沒有特別限制", UNCERTAIN}
+    candidates = {"不想漂髮", "希望時間不要太久", "希望價格不要太高", "沒有特別限制", UNCERTAIN}
 
     return any((msg or "").strip() in candidates for msg in user_messages)
 
@@ -292,11 +272,6 @@ def _budget_range_options_for(direction, user_messages):
     if direction in {"護髮", "頭皮護理"}:
         return ["1200 以下", "1201-1800", UNCERTAIN]
 
-    if direction == "剪髮":
-        if detail == "瀏海修剪":
-            return ["1200 以下", UNCERTAIN]
-        return ["1200 以下", "1201-1800", UNCERTAIN]
-
     return DEFAULT_BUDGET_RANGE_OPTIONS
 
 
@@ -311,12 +286,6 @@ def _resolve_detail(direction, user_messages):
 
     if direction in {"染髮", "補染", "漂髮"}:
         for option in ("全頭染", "補染", "漂髮設計染"):
-            if option in labels:
-                return option
-        return None
-
-    if direction == "剪髮":
-        for option in ("全頭剪髮", "瀏海修剪"):
             if option in labels:
                 return option
         return None
@@ -357,7 +326,7 @@ def _resolve_direction(user_messages):
         return None
 
     first = user_messages[0]
-    direct_map = {"剪髮", "染髮", "補染", "漂髮", "燙髮", "護髮", "頭皮護理", "組合服務"}
+    direct_map = {"染髮", "補染", "漂髮", "燙髮", "護髮", "頭皮護理", "組合服務"}
     if first in direct_map:
         return first
 
@@ -369,9 +338,6 @@ def _resolve_direction(user_messages):
             return "燙髮"
         if classifier == "改善髮質頭皮":
             return "護髮"
-        if classifier == "修整":
-            return "剪髮"
-
     return None
 
 

@@ -1,12 +1,13 @@
 import json
 import os
 import re
+from functools import lru_cache
 import urllib.error
 import urllib.request
 
 from app.services.button_flow import get_task_guided_prompt
 from app.services.prompt_builder import build_model_instruction, get_turn_limit
-from app.services.service_catalog import RECOMMENDATION_RULES, SERVICE_HINTS
+from app.services.service_catalog import RECOMMENDATION_RULES, SERVICE_CATEGORIES, SERVICE_HINTS
 
 
 MAX_BUTTON_OPTIONS = 5
@@ -15,6 +16,17 @@ TEMPLATE_REPLY_PATTERNS = (
     "自然、簡潔的下一句回覆",
     "自然, 簡潔的下一句回覆",
 )
+
+
+def _debug_enabled():
+    return os.getenv("CHATBOT_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_log(event, **fields):
+    if not _debug_enabled():
+        return
+    details = ", ".join(f"{key}={value}" for key, value in fields.items())
+    print(f"[ZOBOT_DEBUG] {event}" + (f" | {details}" if details else ""), flush=True)
 FREE_TEXT_NORMALIZE_MAP = {
     "染頭髮": "染髮",
     "染发": "染髮",
@@ -39,8 +51,6 @@ FREE_TEXT_NORMALIZE_MAP = {
     "燙頭髮": "燙髮",
     "護理": "護髮",
     "做護髮": "護髮",
-    "修瀏海": "瀏海修剪",
-    "剪瀏海": "瀏海修剪",
 }
 
 TASK_SLOT_KEYWORDS = {
@@ -48,7 +58,6 @@ TASK_SLOT_KEYWORDS = {
         "染髮": ("染髮", "染髮", "染发", "上色", "換髮色", "換顏色", "髮色"),
         "燙髮": ("燙髮", "燙头髮", "燙捲", "捲度", "燙"),
         "護髮": ("護髮", "修護", "護理", "保養", "頭皮護理"),
-        "剪髮": ("剪髮", "修剪", "剪", "瀏海修剪"),
     },
     "dye_detail": {
         "全頭染": ("全頭染", "整頭染", "整頭都染", "整頭換色", "整頭都換顏色", "全染"),
@@ -80,8 +89,8 @@ TASK_SLOT_KEYWORDS = {
         "已染淺色/已漂過": ("已染淺色", "已漂過", "漂過", "淺色底", "金色底"),
     },
     "bleach_accept": {
-        "可接受漂髮": ("可接受漂髮", "可以漂", "可漂", "接受漂", "能漂"),
-        "希望不漂髮": ("希望不漂髮", "不想漂", "不要漂", "不漂"),
+        "可接受漂髮": ("可接受漂髮", "可以漂", "可漂", "接受漂", "能漂", "可以", "可以啊", "好", "ok", "沒問題"),
+        "希望不漂髮": ("希望不漂髮", "不想漂", "不要漂", "不漂", "不行", "不可以"),
     },
     "brand_priority": {
         "重視染後髮質修護": ("重視染後髮質修護", "髮質修護", "比較護髮", "髮質優先"),
@@ -104,16 +113,44 @@ TASK_SLOT_KEYWORDS = {
         "要搭配染燙": ("搭配染燙", "一起染燙", "順便染燙"),
         "不搭配染燙": ("不搭配染燙", "單做", "只做護髮", "不一起染燙"),
     },
-    "cut_detail": {
-        "全頭剪髮": ("全頭剪髮", "剪短", "修短", "整體修剪"),
-        "瀏海修剪": ("瀏海修剪", "剪瀏海", "修瀏海"),
-    },
     "restriction": {
         "時間限制": ("趕時間", "時間不要太久", "快一點", "時間限制"),
         "價格限制": ("不要太貴", "希望價格不要太高", "價格限制", "預算有限"),
         "無特別限制": ("沒有特別限制", "都可以", "沒限制"),
     },
 }
+TASK_SLOT_ENUMS = {
+    "direction": ("染髮", "燙髮", "護髮"),
+    "dye_detail": ("全頭染", "補染", "漂髮設計染"),
+    "target_color": ("自然深色", "一般棕色", "高明度特殊色"),
+    "current_base": ("自然黑髮", "已染深色/中深色", "已染淺色/已漂過"),
+    "bleach_accept": ("可接受漂髮", "希望不漂髮"),
+    "brand_priority": ("重視染後髮質修護", "重視顏色表現與CP值"),
+    "perm_detail": ("整體燙髮", "髮根燙", "燙瀏海"),
+    "perm_bleached_history": ("有漂過", "沒有漂過"),
+    "treatment_detail": ("護髮修護", "頭皮護理"),
+    "treatment_combo": ("要搭配染燙", "不搭配染燙"),
+    "restriction": ("時間限制", "價格限制", "無特別限制"),
+}
+
+
+def _service_price_bounds():
+    bounds = {}
+    for category in SERVICE_CATEGORIES:
+        for service in category.get("services", []):
+            name = service.get("name")
+            price_text = str(service.get("price") or "")
+            if not name:
+                continue
+            numbers = [int(token) for token in re.findall(r"\d{3,5}", price_text.replace(",", ""))]
+            if not numbers:
+                bounds[name] = {"min": 0, "max": 999999}
+                continue
+            bounds[name] = {"min": min(numbers), "max": max(numbers)}
+    return bounds
+
+
+SERVICE_PRICE_BOUNDS = _service_price_bounds()
 
 
 def get_chatbot_reply(input_mode, conversation_style, message, history, system_prompt):
@@ -296,11 +333,20 @@ def _get_ollama_reply(input_mode, conversation_style, message, history, system_p
         with urllib.request.urlopen(request, timeout=90) as response:
             response_data = json.loads(response.read().decode("utf-8"))
     except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        _debug_log("ollama_request_failed", input_mode=input_mode, conversation_style=conversation_style)
         return _ai_error_reply("目前本機 AI 無法回覆，請確認 Ollama 是否已啟動。")
 
     text = _extract_ollama_text(response_data)
     parsed = _parse_model_json(text)
     if not parsed:
+        print(f"[OLLAMA_PARSE_DEBUG] text={text}", flush=True)
+        print(f"[OLLAMA_PARSE_DEBUG] parsed={parsed}", flush=True)
+        _debug_log(
+            "ollama_json_parse_failed",
+            input_mode=input_mode,
+            conversation_style=conversation_style,
+            raw_preview=(text or "")[:180],
+        )
         return _ai_error_reply("本機 AI 回覆格式暫時無法解析，請再試一次。")
 
     model_response = _normalize_model_result(parsed, input_mode, source="ollama")
@@ -420,6 +466,7 @@ def _normalize_model_result(result, input_mode, source):
 
 def _force_final_at_turn_limit(model_response, input_mode, conversation_style, message, history):
     task_button_mode = _is_task_button_mode(input_mode, conversation_style)
+    task_text_mode = input_mode == "text" and conversation_style == "task"
     task_mode = conversation_style == "task"
     task_ready = _is_task_ready(
         input_mode=input_mode,
@@ -435,6 +482,13 @@ def _force_final_at_turn_limit(model_response, input_mode, conversation_style, m
             history=history,
             message=message,
         )
+        _debug_log(
+            "task_mode_guard",
+            input_mode=input_mode,
+            task_ready=task_ready,
+            is_final=model_response.get("is_final"),
+            reply_preview=(model_response.get("reply") or "")[:120],
+        )
 
     if model_response["is_final"]:
         if task_mode and not task_ready:
@@ -445,10 +499,47 @@ def _force_final_at_turn_limit(model_response, input_mode, conversation_style, m
                 "is_final": False,
                 "final_output": None,
             }
+        if task_text_mode and task_ready:
+            conversation_text = _conversation_text(history, message)
+            final_output = _build_task_text_final_output(conversation_text)
+            if final_output:
+                return {
+                    "reply": "我已根據你的需求整理出一個參考建議，請查看下方摘要。",
+                    "buttons": [],
+                    "source": model_response.get("source"),
+                    "is_final": True,
+                    "final_output": final_output,
+                }
+            return {
+                "reply": _next_task_free_text_question(conversation_text),
+                "buttons": [],
+                "source": model_response.get("source"),
+                "is_final": False,
+                "final_output": None,
+            }
         return model_response
 
     user_turn_count = _count_user_turns(history)
     conversation_text = _conversation_text(history, message)
+
+    if task_text_mode:
+        if task_ready:
+            final_output = _build_task_text_final_output(conversation_text)
+            if final_output:
+                return {
+                    "reply": "我已根據你的需求整理出一個參考建議，請查看下方摘要。",
+                    "buttons": [],
+                    "source": model_response.get("source"),
+                    "is_final": True,
+                    "final_output": final_output,
+                }
+            return {
+                "reply": _next_task_free_text_question(conversation_text),
+                "buttons": [],
+                "source": model_response.get("source"),
+                "is_final": False,
+                "final_output": None,
+            }
 
     if task_button_mode:
         if task_ready:
@@ -608,7 +699,7 @@ def _is_task_free_text_ready(conversation_text):
     if not text:
         return False
 
-    slots = _extract_task_free_text_slots(text)
+    slots = _extract_task_slots(text)
     direction = slots.get("direction")
     if direction is None:
         return False
@@ -618,19 +709,15 @@ def _is_task_free_text_ready(conversation_text):
 
     if direction == "染髮":
         required = ("dye_detail", "target_color", "current_base", "bleach_accept", "brand_priority", "restriction")
-        return all(slots.get(field) for field in required)
+        return all(slots.get(field) for field in required) and _has_budget_compatible_candidates(slots, text)
 
     if direction == "燙髮":
         required = ("perm_detail", "perm_bleached_history", "restriction")
-        return all(slots.get(field) for field in required)
+        return all(slots.get(field) for field in required) and _has_budget_compatible_candidates(slots, text)
 
     if direction == "護髮":
         required = ("treatment_detail", "treatment_combo", "restriction")
-        return all(slots.get(field) for field in required)
-
-    if direction == "剪髮":
-        required = ("cut_detail", "restriction")
-        return all(slots.get(field) for field in required)
+        return all(slots.get(field) for field in required) and _has_budget_compatible_candidates(slots, text)
 
     return False
 
@@ -643,8 +730,6 @@ def _detect_direction(text):
         return "燙髮"
     if _has_any_phrase(normalized_text, ("護髮", "頭皮護理", "修護")):
         return "護髮"
-    if _has_any_phrase(normalized_text, ("剪髮", "瀏海修剪", "修瀏海")):
-        return "剪髮"
     return None
 
 
@@ -690,10 +775,10 @@ def _contains_service_name(text):
 
 def _next_task_free_text_question(conversation_text):
     text = _normalize_task_free_text(conversation_text)
-    slots = _extract_task_free_text_slots(text)
+    slots = _extract_task_slots(text)
     direction = slots.get("direction")
     if direction is None:
-        return "你這次主要想做哪一類：染髮、燙髮、護髮還是剪髮？"
+        return "你這次主要想做哪一類：染髮、燙髮，還是護髮？"
 
     if direction == "染髮":
         if not slots.get("dye_detail"):
@@ -710,6 +795,8 @@ def _next_task_free_text_question(conversation_text):
             return "你的預算價位區間大約在哪裡？例如 1200以下、1201-1800、1801-2400、2401以上。"
         if not slots.get("restriction"):
             return "你是否還有時間或價格上的限制？"
+        if not _has_budget_compatible_candidates(slots, text):
+            return "目前預算可能和條件不一致，你想提高預算，還是調整服務需求？"
         return "收到，我會根據你的條件整理最適合的服務方案。"
 
     if direction == "燙髮":
@@ -721,6 +808,8 @@ def _next_task_free_text_question(conversation_text):
             return "你的預算價位區間大約在哪裡？例如 1200以下、1201-1800、1801-2400、2401以上。"
         if not slots.get("restriction"):
             return "你是否還有時間或價格上的限制？"
+        if not _has_budget_compatible_candidates(slots, text):
+            return "目前預算可能和條件不一致，你想提高預算，還是調整服務需求？"
         return "收到，我會根據你的條件整理最適合的服務方案。"
 
     if direction == "護髮":
@@ -732,15 +821,8 @@ def _next_task_free_text_question(conversation_text):
             return "你的預算價位區間大約在哪裡？例如 1200以下、1201-1800。"
         if not slots.get("restriction"):
             return "你是否還有時間或價格上的限制？"
-        return "收到，我會根據你的條件整理最適合的服務方案。"
-
-    if direction == "剪髮":
-        if not slots.get("cut_detail"):
-            return "你這次是全頭剪髮，還是瀏海修剪？"
-        if not slots.get("budget_range"):
-            return "你的預算價位區間大約在哪裡？例如 1200以下、1201-1800。"
-        if not slots.get("restriction"):
-            return "你是否還有時間上的限制？"
+        if not _has_budget_compatible_candidates(slots, text):
+            return "目前預算可能和條件不一致，你想提高預算，還是調整服務需求？"
         return "收到，我會根據你的條件整理最適合的服務方案。"
 
     return "我需要再確認一個條件，才能準確推薦。你目前最在意的是預算、時間，還是髮況限制？"
@@ -758,7 +840,7 @@ def _normalize_task_free_text(text):
     return lowered
 
 
-def _extract_task_free_text_slots(text):
+def _extract_task_free_text_slots_rule(text):
     normalized = _normalize_task_free_text(text)
     slots = {"budget_range": _detect_budget_range(normalized)}
 
@@ -766,6 +848,126 @@ def _extract_task_free_text_slots(text):
         slots[slot_key] = _detect_slot_value(normalized, candidates)
 
     return slots
+
+
+def _extract_task_slots(text):
+    return _extract_task_slots_cached(_normalize_task_free_text(text))
+
+
+@lru_cache(maxsize=128)
+def _extract_task_slots_cached(normalized_text):
+    rule_slots = _extract_task_free_text_slots_rule(normalized_text)
+    llm_slots = _extract_task_slots_with_llm(normalized_text)
+    if not llm_slots:
+        _debug_log("slot_extract_rule_only", text_preview=normalized_text[:100], slots=rule_slots)
+        return rule_slots
+
+    merged = dict(rule_slots)
+    for slot_key in TASK_SLOT_ENUMS:
+        llm_value = llm_slots.get(slot_key)
+        if llm_value in TASK_SLOT_ENUMS[slot_key] and _slot_value_supported_by_user_text(slot_key, llm_value, normalized_text):
+            merged[slot_key] = llm_value
+
+    llm_budget = llm_slots.get("budget_range")
+    merged_budget = merged.get("budget_range")
+    if (not merged_budget or not _is_specific_budget_bucket(merged_budget)) and llm_budget:
+        if _budget_value_supported_by_user_text(llm_budget, normalized_text):
+            merged["budget_range"] = llm_budget
+        else:
+            merged["budget_range"] = merged_budget or rule_slots.get("budget_range")
+
+    _debug_log(
+        "slot_extract_merged",
+        text_preview=normalized_text[:100],
+        llm_slots=llm_slots,
+        rule_slots=rule_slots,
+        merged_slots=merged,
+    )
+    return merged
+
+
+def _extract_task_slots_with_llm(normalized_text):
+    provider = os.getenv("AI_PROVIDER", "mock").strip().lower()
+    if provider != "ollama":
+        _debug_log("slot_extract_llm_skipped", provider=provider)
+        return None
+
+    model = os.getenv("OLLAMA_MODEL", "gemma3:4b").strip()
+    endpoint = os.getenv("OLLAMA_API_URL", "http://localhost:11434/api/chat").strip()
+    schema_text = (
+        "direction: 染髮|燙髮|護髮|null\n"
+        "dye_detail: 全頭染|補染|漂髮設計染|null\n"
+        "target_color: 自然深色|一般棕色|高明度特殊色|null\n"
+        "current_base: 自然黑髮|已染深色/中深色|已染淺色/已漂過|null\n"
+        "bleach_accept: 可接受漂髮|希望不漂髮|null\n"
+        "brand_priority: 重視染後髮質修護|重視顏色表現與CP值|null\n"
+        "perm_detail: 整體燙髮|髮根燙|燙瀏海|null\n"
+        "perm_bleached_history: 有漂過|沒有漂過|null\n"
+        "treatment_detail: 護髮修護|頭皮護理|null\n"
+        "treatment_combo: 要搭配染燙|不搭配染燙|null\n"
+        "restriction: 時間限制|價格限制|無特別限制|null\n"
+        "budget_range: 1200以下|1201-1800|1801-2400|2401以上|已提供預算|null"
+    )
+    system_prompt = (
+        "你是欄位抽取器。只回傳 JSON。"
+        "將使用者語句映射到既定欄位，沒提到就填 null。"
+    )
+    user_prompt = f"輸入文本：{normalized_text}\n\n請依照這個 schema 回傳 JSON：\n{schema_text}"
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "format": "json",
+        "stream": False,
+        "options": {
+            "temperature": 0,
+            "num_predict": 220,
+        },
+    }
+
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            response_data = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        _debug_log("slot_extract_llm_request_failed")
+        return None
+
+    text = _extract_ollama_text(response_data)
+    parsed = _parse_model_json(text)
+    if not isinstance(parsed, dict):
+        _debug_log("slot_extract_llm_parse_failed", raw_preview=(text or "")[:160])
+        return None
+
+    validated = _validate_task_slot_payload(parsed)
+    _debug_log("slot_extract_llm_success", parsed=parsed, validated=validated)
+    return validated
+
+
+def _validate_task_slot_payload(parsed):
+    validated = {}
+    for slot_key, allowed_values in TASK_SLOT_ENUMS.items():
+        value = parsed.get(slot_key)
+        if isinstance(value, str) and value in allowed_values:
+            validated[slot_key] = value
+        else:
+            validated[slot_key] = None
+
+    budget = parsed.get("budget_range")
+    if isinstance(budget, str) and budget in {"1200以下", "1201-1800", "1801-2400", "2401以上", "已提供預算"}:
+        validated["budget_range"] = budget
+    else:
+        validated["budget_range"] = None
+
+    return validated
 
 
 def _detect_slot_value(text, candidates):
@@ -785,10 +987,230 @@ def _detect_budget_range(text):
         return "1201-1800"
     if _has_any_phrase(text, ("1801-2400", "1801 到 2400", "1801~2400")):
         return "1801-2400"
-    if _has_any_phrase(text, ("2401以上", "2401 以上", "2500以上", "三千以下")):
+    if _has_any_phrase(text, ("2401以上", "2401 以上", "2500以上")):
+        return "2401以上"
+
+    constraint = _parse_budget_constraint(text)
+    if not constraint:
+        return "已提供預算"
+
+    min_budget = constraint.get("min")
+    max_budget = constraint.get("max")
+    if max_budget is not None and max_budget <= 1200:
+        return "1200以下"
+    if min_budget is not None and max_budget is not None and min_budget >= 1201 and max_budget <= 1800:
+        return "1201-1800"
+    if min_budget is not None and max_budget is not None and min_budget >= 1801 and max_budget <= 2400:
+        return "1801-2400"
+    if min_budget is not None and min_budget >= 2401:
         return "2401以上"
 
     return "已提供預算"
+
+
+def _parse_budget_constraint(text):
+    content = (text or "").replace(",", "")
+    if not content:
+        return None
+
+    range_match = re.search(r"(\d{3,5})\s*[-~～到至]\s*(\d{3,5})", content)
+    if range_match:
+        left = int(range_match.group(1))
+        right = int(range_match.group(2))
+        return {"min": min(left, right), "max": max(left, right)}
+
+    under_match = re.search(r"(\d{3,5})\s*(以下|以內|以内|內)", content)
+    if under_match:
+        return {"min": 0, "max": int(under_match.group(1))}
+
+    over_match = re.search(r"(\d{3,5})\s*(以上|起)", content)
+    if over_match:
+        return {"min": int(over_match.group(1)), "max": None}
+
+    return None
+
+
+def _is_specific_budget_bucket(value):
+    token = str(value or "")
+    return token in {"1201-1800", "1801-2400"} or ("1200" in token and "-" not in token) or ("2401" in token and "-" not in token)
+
+
+def _budget_constraint_from_budget_range(budget_range, normalized_text):
+    token = str(budget_range or "")
+    if token == "1201-1800":
+        return {"min": 1201, "max": 1800}
+    if token == "1801-2400":
+        return {"min": 1801, "max": 2400}
+    if "1200" in token and "-" not in token:
+        return {"min": 0, "max": 1200}
+    if "2401" in token and "-" not in token:
+        return {"min": 2401, "max": None}
+    return _parse_budget_constraint(normalized_text)
+
+
+def _slot_value_supported_by_user_text(slot_key, value, normalized_text):
+    if not value:
+        return False
+    content = (normalized_text or "").lower()
+    if not content:
+        return False
+    if value.lower() in content:
+        return True
+    phrases = TASK_SLOT_KEYWORDS.get(slot_key, {}).get(value, ())
+    return any((phrase or "").lower() in content for phrase in phrases)
+
+
+def _budget_value_supported_by_user_text(value, normalized_text):
+    if not value:
+        return False
+    detected = _detect_budget_range(normalized_text)
+    if detected == value:
+        return True
+    if _is_specific_budget_bucket(value):
+        return False
+    return _has_budget_info(normalized_text)
+
+
+def _budget_overlap(service_min, service_max, user_min, user_max):
+    left = user_min if user_min is not None else 0
+    right = user_max if user_max is not None else 999999
+    return service_min <= right and service_max >= left
+
+
+def _filter_services_by_budget(service_names, budget_range, normalized_text):
+    constraint = _budget_constraint_from_budget_range(budget_range, normalized_text)
+    if not constraint:
+        return []
+
+    user_min = constraint.get("min")
+    user_max = constraint.get("max")
+    matched = []
+    for service_name in service_names:
+        bounds = SERVICE_PRICE_BOUNDS.get(service_name)
+        if not bounds:
+            continue
+        if _budget_overlap(bounds["min"], bounds["max"], user_min, user_max):
+            matched.append(service_name)
+    return matched
+
+
+def _service_names_by_category_index(index):
+    if index < 0 or index >= len(SERVICE_CATEGORIES):
+        return []
+    return [service.get("name") for service in SERVICE_CATEGORIES[index].get("services", []) if service.get("name")]
+
+
+def _candidate_services_for_task_slots(slots):
+    direction = slots.get("direction")
+    direction_values = TASK_SLOT_ENUMS.get("direction", ())
+    if direction is None or len(direction_values) < 3:
+        return []
+
+    dye_direction, perm_direction, treatment_direction = direction_values[0], direction_values[1], direction_values[2]
+
+    if direction == dye_direction:
+        dye_services = _service_names_by_category_index(0)
+        if len(dye_services) < 4:
+            return dye_services
+
+        detail = slots.get("dye_detail")
+        target_color = slots.get("target_color")
+        bleach_accept = slots.get("bleach_accept")
+        brand_priority = slots.get("brand_priority")
+        dye_detail_values = TASK_SLOT_ENUMS.get("dye_detail", ())
+        target_color_values = TASK_SLOT_ENUMS.get("target_color", ())
+        bleach_values = TASK_SLOT_ENUMS.get("bleach_accept", ())
+        brand_values = TASK_SLOT_ENUMS.get("brand_priority", ())
+
+        if len(dye_detail_values) >= 3 and detail == dye_detail_values[1]:
+            return [dye_services[2]]
+        if len(dye_detail_values) >= 3 and detail == dye_detail_values[2]:
+            return [dye_services[3]]
+
+        candidates = []
+        if len(target_color_values) >= 3 and target_color == target_color_values[2]:
+            if len(bleach_values) >= 1 and bleach_accept == bleach_values[0]:
+                candidates.append(dye_services[3])
+
+        if len(brand_values) >= 2 and brand_priority == brand_values[0]:
+            candidates.extend([dye_services[1], dye_services[0]])
+        elif len(brand_values) >= 2 and brand_priority == brand_values[1]:
+            candidates.extend([dye_services[0], dye_services[1]])
+        else:
+            candidates.extend([dye_services[0], dye_services[1]])
+
+        deduped = []
+        for item in candidates:
+            if item and item not in deduped:
+                deduped.append(item)
+        return deduped
+
+    if direction == perm_direction:
+        perm_services = _service_names_by_category_index(1)
+        if len(perm_services) < 4:
+            return perm_services
+
+        detail = slots.get("perm_detail")
+        history = slots.get("perm_bleached_history")
+        perm_detail_values = TASK_SLOT_ENUMS.get("perm_detail", ())
+        history_values = TASK_SLOT_ENUMS.get("perm_bleached_history", ())
+
+        if len(perm_detail_values) >= 3 and detail == perm_detail_values[1]:
+            return [perm_services[2]]
+        if len(perm_detail_values) >= 3 and detail == perm_detail_values[2]:
+            return [perm_services[3]]
+        if len(history_values) >= 1 and history == history_values[0]:
+            return [perm_services[1], perm_services[0]]
+        return [perm_services[0], perm_services[1]]
+
+    if direction == treatment_direction:
+        treatment_services = _service_names_by_category_index(2)
+        if len(treatment_services) < 3:
+            return treatment_services
+
+        detail = slots.get("treatment_detail")
+        combo = slots.get("treatment_combo")
+        detail_values = TASK_SLOT_ENUMS.get("treatment_detail", ())
+        combo_values = TASK_SLOT_ENUMS.get("treatment_combo", ())
+
+        if len(detail_values) >= 2 and detail == detail_values[1]:
+            return [treatment_services[2]]
+        if len(combo_values) >= 1 and combo == combo_values[0]:
+            return [treatment_services[0], treatment_services[1], treatment_services[2]]
+        return [treatment_services[1], treatment_services[0], treatment_services[2]]
+
+    return []
+
+
+def _has_budget_compatible_candidates(slots, normalized_text):
+    budget_range = slots.get("budget_range")
+    if not budget_range:
+        return False
+    candidates = _candidate_services_for_task_slots(slots)
+    if not candidates:
+        return False
+    filtered = _filter_services_by_budget(candidates, budget_range, normalized_text)
+    return len(filtered) > 0
+
+
+def _build_task_text_final_output(conversation_text):
+    normalized_text = _normalize_task_free_text(conversation_text)
+    if not normalized_text:
+        return None
+
+    slots = _extract_task_slots(normalized_text)
+    candidates = _candidate_services_for_task_slots(slots)
+    if not candidates:
+        return None
+
+    filtered = _filter_services_by_budget(candidates, slots.get("budget_range"), normalized_text)
+    if not filtered:
+        return None
+
+    service_name = filtered[0]
+    if service_name not in SERVICE_HINTS:
+        return None
+    return _final_output_for(service_name)
 
 
 def _build_final_output(conversation_text, allow_inferred_recommendation):
