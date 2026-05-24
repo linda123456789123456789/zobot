@@ -1,11 +1,18 @@
+import re
+
+from app.services.service_catalog import SERVICE_CATEGORIES
+
+
 UNCERTAIN = "我不確定"
 UNCERTAIN_ALIASES = {UNCERTAIN, "不確定"}
 BUDGET_KEYWORD = "預算範圍"
 DEFAULT_BUDGET_RANGE_OPTIONS = ["1200 以下", "1201-1800", "1801-2400", "2401 以上", UNCERTAIN]
+BUDGET_RANGE_LABELS = ("1200 以下", "1201-1800", "1801-2400", "2401 以上")
 COLOR_TARGET_OPTIONS = ["自然深色", "一般棕色", "高明度特殊色", UNCERTAIN]
 CURRENT_BASE_OPTIONS = ["自然黑髮", "已染深色/中深色", "已染淺色/已漂過", UNCERTAIN]
 BLEACH_PREFERENCE_OPTIONS = ["可接受漂髮", "希望不漂髮", UNCERTAIN]
 COLOR_BRAND_PRIORITY_OPTIONS = ["重視染後髮質修護", "重視顏色表現與CP值", UNCERTAIN]
+TRADEOFF_PRIORITY_OPTIONS = ["以預算為優先", "以效果為優先", UNCERTAIN]
 
 TASK_LED_STEPS = [
     {
@@ -23,10 +30,6 @@ TASK_LED_STEPS = [
     {
         "question": "請選擇最重要的必要條件。",
         "buttons": ["預算範圍", "時間限制", "髮況限制", UNCERTAIN],
-    },
-    {
-        "question": "請選擇是否有以下限制。",
-        "buttons": ["不想漂髮", "希望時間不要太久", "希望價格不要太高", "沒有特別限制", UNCERTAIN],
     },
 ]
 
@@ -102,12 +105,19 @@ def get_task_guided_prompt(history):
         }
 
     direction = _resolve_direction(user_messages)
+    if not direction:
+        return {
+            "question": "請先選擇最接近你的目標。",
+            "buttons": ["改變髮色", "改變髮型", "改善髮質", UNCERTAIN],
+        }
 
     if _needs_budget_range_followup(user_messages):
-        return {
-            "question": "請選擇你的預算價位範圍。",
-            "buttons": _budget_range_options_for(direction, user_messages),
-        }
+        budget_options = _budget_range_options_for(direction, user_messages)
+        if _has_multiple_budget_options(budget_options):
+            return {
+                "question": "請選擇你的預算價位範圍。",
+                "buttons": budget_options,
+            }
 
     if turn == 1:
         if _is_uncertain(user_messages[0]):
@@ -117,14 +127,7 @@ def get_task_guided_prompt(history):
             }
         return _detail_question_for_direction(direction)
 
-    requirement_question = _next_requirement_question(direction, user_messages)
-    if requirement_question:
-        return requirement_question
-
-    if not _has_restriction_answer(user_messages, direction):
-        return _restriction_question_for_direction(direction)
-
-    return None
+    return _next_missing_slot_prompt(direction, user_messages)
 
 
 def _detail_question_for_direction(direction):
@@ -141,37 +144,27 @@ def _detail_question_for_direction(direction):
     return {"question": "請選擇你想做的服務細項。", "buttons": ["染髮", "燙髮", "護髮", UNCERTAIN]}
 
 
-def _requirement_question_for_direction(direction):
-    if direction in {"染髮", "補染", "漂髮"}:
-        return {
-            "question": "請選擇是否需要漂髮。",
-            "buttons": ["需要漂髮", "不需要漂髮", UNCERTAIN],
-        }
+def _next_missing_slot_prompt(direction, user_messages):
     if direction == "燙髮":
-        return {
-            "question": "你有漂過頭髮嗎？",
-            "buttons": ["有漂過", "沒有漂過", UNCERTAIN],
-        }
-    return {"question": "請選擇你的預算價位範圍。", "buttons": _budget_range_options_for(direction, [])}
-
-
-def _restriction_question_for_direction(direction):
-    return {
-        "question": "請選擇是否有以下限制。",
-        "buttons": ["不想漂髮", "希望時間不要太久", "希望價格不要太高", "沒有特別限制", UNCERTAIN],
-    }
-
-
-def _next_requirement_question(direction, user_messages):
-    if direction == "燙髮":
+        if not _resolve_detail(direction, user_messages):
+            return _detail_question_for_direction(direction)
         if not _has_any(user_messages, {"有漂過", "沒有漂過", UNCERTAIN}):
             return {"question": "你有漂過頭髮嗎？", "buttons": ["有漂過", "沒有漂過", UNCERTAIN]}
         if not _has_budget_range(user_messages):
-            return {"question": "請選擇你的預算價位範圍。", "buttons": _budget_range_options_for(direction, user_messages)}
+            budget_options = _budget_range_options_for(direction, user_messages)
+            if _has_multiple_budget_options(budget_options):
+                return {"question": "請選擇你的預算價位範圍。", "buttons": budget_options}
+        if _needs_priority_followup(direction, user_messages):
+            return {
+                "question": "看起來預算與效果偏好有取捨，你想優先哪一個？",
+                "buttons": TRADEOFF_PRIORITY_OPTIONS,
+            }
         return None
 
     if direction in {"染髮", "補染", "漂髮"}:
         detail = _resolve_detail(direction, user_messages)
+        if not detail:
+            return _detail_question_for_direction(direction)
 
         # 補染多半可直接進入預算與限制，不強制再問色系與底色。
         if detail != "補染":
@@ -191,23 +184,184 @@ def _next_requirement_question(direction, user_messages):
                 }
 
         if not _has_budget_range(user_messages):
-            return {"question": "請選擇你的預算價位範圍。", "buttons": _budget_range_options_for(direction, user_messages)}
+            budget_options = _budget_range_options_for(direction, user_messages)
+            if _has_multiple_budget_options(budget_options):
+                return {"question": "請選擇你的預算價位範圍。", "buttons": budget_options}
+        if _needs_priority_followup(direction, user_messages):
+            return {
+                "question": "看起來預算與效果偏好有取捨，你想優先哪一個？",
+                "buttons": TRADEOFF_PRIORITY_OPTIONS,
+            }
         return None
 
     if direction == "護髮":
+        if not _resolve_detail(direction, user_messages):
+            return _detail_question_for_direction(direction)
         if not _has_budget_range(user_messages):
-            return {"question": "請選擇你的預算價位範圍。", "buttons": _budget_range_options_for(direction, user_messages)}
+            budget_options = _budget_range_options_for(direction, user_messages)
+            if _has_multiple_budget_options(budget_options):
+                return {"question": "請選擇你的預算價位範圍。", "buttons": budget_options}
+        if _needs_priority_followup(direction, user_messages):
+            return {
+                "question": "看起來預算與效果偏好有取捨，你想優先哪一個？",
+                "buttons": TRADEOFF_PRIORITY_OPTIONS,
+            }
         return None
 
     if not _has_budget_range(user_messages):
-        return {"question": "請選擇你的預算價位範圍。", "buttons": _budget_range_options_for(direction, user_messages)}
+        budget_options = _budget_range_options_for(direction, user_messages)
+        if _has_multiple_budget_options(budget_options):
+            return {"question": "請選擇你的預算價位範圍。", "buttons": budget_options}
     return None
 
 
-def _has_restriction_answer(user_messages, direction):
-    candidates = {"不想漂髮", "希望時間不要太久", "希望價格不要太高", "沒有特別限制", UNCERTAIN}
+def _has_priority_choice_answer(user_messages):
+    return _has_any(user_messages, set(TRADEOFF_PRIORITY_OPTIONS))
 
-    return any((msg or "").strip() in candidates for msg in user_messages)
+
+def _service_price_bounds():
+    bounds = {}
+    for category in SERVICE_CATEGORIES:
+        for service in category.get("services", []):
+            name = service.get("name")
+            price_text = str(service.get("price") or "")
+            if not name:
+                continue
+            numbers = [int(token) for token in re.findall(r"\d{3,5}", price_text.replace(",", ""))]
+            if not numbers:
+                bounds[name] = {"min": 0, "max": 999999}
+                continue
+            bounds[name] = {"min": min(numbers), "max": max(numbers)}
+    return bounds
+
+
+SERVICE_PRICE_BOUNDS = _service_price_bounds()
+
+
+def _budget_constraint_from_label(label):
+    token = str(label or "").strip()
+    if token == "1200 以下":
+        return {"min": None, "max": 1200}
+    if token == "1201-1800":
+        return {"min": 1201, "max": 1800}
+    if token == "1801-2400":
+        return {"min": 1801, "max": 2400}
+    if token == "2401 以上":
+        return {"min": 2401, "max": None}
+    return None
+
+
+def _service_price_overlaps_budget(service_bounds, budget_constraint):
+    service_min = service_bounds.get("min")
+    service_max = service_bounds.get("max")
+    if service_min is None or service_max is None:
+        return False
+
+    budget_min = budget_constraint.get("min")
+    budget_max = budget_constraint.get("max")
+
+    if budget_min is not None and service_max < budget_min:
+        return False
+    if budget_max is not None and service_min > budget_max:
+        return False
+    return True
+
+
+def _service_matches_budget(service_name, budget_label):
+    constraint = _budget_constraint_from_label(budget_label)
+    if not constraint:
+        return False
+    bounds = SERVICE_PRICE_BOUNDS.get(service_name)
+    if not bounds:
+        return False
+    return _service_price_overlaps_budget(bounds, constraint)
+
+
+def _service_names_by_category_index(index):
+    if index < 0 or index >= len(SERVICE_CATEGORIES):
+        return []
+    return [service.get("name") for service in SERVICE_CATEGORIES[index].get("services", []) if service.get("name")]
+
+
+def _candidate_services_for_direction(direction, user_messages):
+    if direction in {"染髮", "補染", "漂髮"}:
+        dye_services = _service_names_by_category_index(0)
+        if len(dye_services) < 4:
+            return dye_services
+
+        detail = _resolve_detail(direction, user_messages)
+        if detail == "補染":
+            return [dye_services[2]]
+        if detail == "漂髮設計染":
+            return [dye_services[3]]
+
+        target_color = _pick_first(user_messages, set(COLOR_TARGET_OPTIONS))
+        bleach_accept = _pick_first(user_messages, set(BLEACH_PREFERENCE_OPTIONS))
+        brand_priority = _pick_first(user_messages, set(COLOR_BRAND_PRIORITY_OPTIONS))
+
+        candidates = []
+        if target_color == "高明度特殊色" and bleach_accept == "可接受漂髮":
+            candidates.append(dye_services[3])
+        if brand_priority == "重視染後髮質修護":
+            candidates.extend([dye_services[1], dye_services[0]])
+        elif brand_priority == "重視顏色表現與CP值":
+            candidates.extend([dye_services[0], dye_services[1]])
+        else:
+            candidates.extend([dye_services[0], dye_services[1]])
+
+        deduped = []
+        for item in candidates:
+            if item and item not in deduped:
+                deduped.append(item)
+        return deduped
+
+    if direction == "燙髮":
+        perm_services = _service_names_by_category_index(1)
+        if len(perm_services) < 4:
+            return perm_services
+
+        detail = _resolve_detail(direction, user_messages)
+        if detail == "髮根燙":
+            return [perm_services[2]]
+        if detail == "燙瀏海":
+            return [perm_services[3]]
+        if _has_any(user_messages, {"有漂過"}):
+            return [perm_services[1], perm_services[0]]
+        return [perm_services[0], perm_services[1]]
+
+    if direction == "護髮":
+        treatment_services = _service_names_by_category_index(2)
+        if len(treatment_services) < 3:
+            return treatment_services
+
+        detail = _resolve_detail(direction, user_messages)
+        if detail == "受損修護":
+            return [treatment_services[0], treatment_services[1], treatment_services[2]]
+        if detail == "柔順抗毛躁":
+            return [treatment_services[1], treatment_services[0], treatment_services[2]]
+        if detail == "日常保養":
+            return [treatment_services[2], treatment_services[1], treatment_services[0]]
+        return [treatment_services[1], treatment_services[0], treatment_services[2]]
+
+    return []
+
+
+def _needs_priority_followup(direction, user_messages):
+    if _has_priority_choice_answer(user_messages):
+        return False
+    budget_label = _pick_first(user_messages, set(DEFAULT_BUDGET_RANGE_OPTIONS))
+    if not budget_label:
+        return False
+
+    ranked = _candidate_services_for_direction(direction, user_messages)
+    if len(ranked) < 2:
+        return False
+
+    filtered = [service_name for service_name in ranked if _service_matches_budget(service_name, budget_label)]
+    if not filtered:
+        return False
+
+    return ranked[0] != filtered[0]
 
 
 def _needs_budget_range_followup(user_messages):
@@ -231,12 +385,22 @@ def _has_budget_range(user_messages):
     return any(_is_budget_range_answer(msg) for msg in user_messages)
 
 
+def _has_multiple_budget_options(options):
+    actionable = [option for option in (options or []) if option != UNCERTAIN]
+    return len(actionable) > 1
+
+
 def _has_any(user_messages, candidates):
     normalized = {(msg or "").strip() for msg in user_messages}
     return any(candidate in normalized for candidate in candidates)
 
 
 def _budget_range_options_for(direction, user_messages):
+    ranked_candidates = _candidate_services_for_direction(direction, user_messages)
+    dynamic_options = _budget_range_options_from_candidates(ranked_candidates)
+    if dynamic_options:
+        return dynamic_options + [UNCERTAIN]
+
     detail = _resolve_detail(direction, user_messages)
 
     if direction == "燙髮":
@@ -263,6 +427,28 @@ def _budget_range_options_for(direction, user_messages):
         return ["1200 以下", "1201-1800", UNCERTAIN]
 
     return DEFAULT_BUDGET_RANGE_OPTIONS
+
+
+def _budget_range_options_from_candidates(ranked_candidates):
+    if not ranked_candidates:
+        return []
+
+    options = []
+    previous_signature = None
+    for budget_label in BUDGET_RANGE_LABELS:
+        filtered = [service_name for service_name in ranked_candidates if _service_matches_budget(service_name, budget_label)]
+        if not filtered:
+            continue
+
+        # Keep only ranges that actually change the remaining candidate set.
+        signature = tuple(filtered)
+        if signature == previous_signature:
+            continue
+
+        options.append(budget_label)
+        previous_signature = signature
+
+    return options
 
 
 def _resolve_detail(direction, user_messages):

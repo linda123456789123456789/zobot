@@ -266,14 +266,14 @@ def _task_button_step_instruction(current_turn):
     if current_turn == 3:
         return (
             "task+button Step 3：詢問必要條件（依方向分支）。\n"
-            "- 染髮：目標色系 / 目前底色 /（必要時）可否漂髮 / 預算。\n"
-            "- 燙髮：是否漂過 / 是否懷孕 / 預算。\n"
+            "- 染髮：目標色系 / 目前底色 /（必要時）可否漂髮 / 染後偏好 / 預算。\n"
+            "- 燙髮：燙髮細項 / 是否漂過 / 預算。\n"
             "- 護髮：先問髮絲需求細項（受損修護/柔順抗毛躁/日常保養），再問預算。\n"
         )
     if current_turn == 4:
         return (
-            "task+button Step 4：做限制檢核。"
-            "若涉及染/燙/漂，必查懷孕、曾漂想燙、嚴重受損等限制並標記現場評估。\n"
+            "task+button Step 4：做衝突檢核。"
+            "若偏好與預算衝突，必須追問優先順序（預算優先或效果優先），再收斂推薦。\n"
         )
     return (
         "task+button Step 5：檢查必填欄位是否已完整。\n"
@@ -288,7 +288,7 @@ def _phase_instruction(input_mode, conversation_style, current_turn):
     if conversation_style == "task":
         if current_turn <= 2:
             return (
-                "本輪 task-led 要求：先確認服務方向（染髮/補染/漂髮/燙髮/護髮）。"
+                "本輪 task-led 要求：先確認服務方向（染髮/燙髮/護髮）。"
                 "只問一個能直接推進決策的封閉式問題。\n"
             )
         if current_turn <= 3:
@@ -298,7 +298,7 @@ def _phase_instruction(input_mode, conversation_style, current_turn):
             )
         if current_turn <= 4:
             return (
-                "本輪 task-led 要求：確認必要條件與限制檢核（預算/時間/髮況/懷孕/漂髮相關）。"
+                "本輪 task-led 要求：確認必要條件與衝突檢核（預算/偏好/漂髮相關）。"
                 "避免回頭重問已回答的項目。\n"
             )
         return (

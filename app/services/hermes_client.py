@@ -99,6 +99,11 @@ TASK_SLOT_KEYWORDS = {
         "重視染後髮質修護": ("重視染後髮質修護", "髮質修護", "比較護髮", "髮質優先"),
         "重視顏色表現與CP值": ("重視顏色表現與CP值", "顏色表現", "cp值", "價格優先", "預算優先"),
     },
+    "tradeoff_priority": {
+        "以預算為優先": ("以預算為優先", "以價位為優先", "價位優先", "預算優先", "以預算為主", "以價格為主"),
+        "以效果為優先": ("以效果為優先", "以染後護理為優先", "以染後護髮為優先", "護理優先", "護髮優先", "髮質優先", "染後修護優先", "以護理為主", "效果優先"),
+        "我不確定": ("我不確定", "不確定"),
+    },
     "perm_detail": {
         "整體燙髮": ("整體燙髮", "全頭燙", "燙全頭", "燙捲"),
         "髮根燙": ("髮根燙", "髮根蓬鬆", "頭頂扁塌"),
@@ -113,11 +118,6 @@ TASK_SLOT_KEYWORDS = {
         "柔順抗毛躁": ("柔順抗毛躁", "柔順", "毛躁", "打結", "觸感"),
         "日常保養": ("日常保養", "入門護髮", "基礎修護", "光澤", "保養"),
     },
-    "restriction": {
-        "時間限制": ("趕時間", "時間不要太久", "快一點", "時間限制"),
-        "價格限制": ("不要太貴", "希望價格不要太高", "價格限制", "預算有限"),
-        "無特別限制": ("沒有特別限制", "都可以", "沒限制"),
-    },
 }
 TASK_SLOT_ENUMS = {
     "direction": ("染髮", "燙髮", "護髮"),
@@ -126,10 +126,10 @@ TASK_SLOT_ENUMS = {
     "current_base": ("自然黑髮", "已染深色/中深色", "已染淺色/已漂過"),
     "bleach_accept": ("可接受漂髮", "希望不漂髮"),
     "brand_priority": ("重視染後髮質修護", "重視顏色表現與CP值"),
+    "tradeoff_priority": ("以預算為優先", "以效果為優先", "我不確定"),
     "perm_detail": ("整體燙髮", "髮根燙", "燙瀏海"),
     "perm_bleached_history": ("有漂過", "沒有漂過"),
     "treatment_detail": ("受損修護", "柔順抗毛躁", "日常保養"),
-    "restriction": ("時間限制", "價格限制", "無特別限制"),
 }
 
 
@@ -309,24 +309,34 @@ def _get_gemini_reply(input_mode, conversation_style, message, history, system_p
 def _get_ollama_reply(input_mode, conversation_style, message, history, system_prompt):
     model = os.getenv("OLLAMA_MODEL", "gemma3:4b").strip()
     endpoint = os.getenv("OLLAMA_API_URL", "http://localhost:11434/api/chat").strip()
+    resolved_endpoint = _resolve_ollama_endpoint(endpoint)
+    use_openai_compat = _is_openai_compat_endpoint(endpoint)
     prompt = build_model_instruction(
         input_mode,
         conversation_style,
         system_prompt,
         history=history,
     )
-    payload = {
-        "model": model,
-        "messages": _build_ollama_messages(prompt, message, history),
-        "format": "json",
-        "stream": False,
-        "options": {
+    if use_openai_compat:
+        payload = {
+            "model": model,
+            "messages": _build_ollama_messages(prompt, message, history),
+            "stream": False,
             "temperature": 0.4,
-        },
-    }
+        }
+    else:
+        payload = {
+            "model": model,
+            "messages": _build_ollama_messages(prompt, message, history),
+            "format": "json",
+            "stream": False,
+            "options": {
+                "temperature": 0.4,
+            },
+        }
 
     request = urllib.request.Request(
-        endpoint,
+        resolved_endpoint,
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -424,7 +434,28 @@ def _extract_ollama_text(response_data):
     try:
         return response_data["message"]["content"]
     except (KeyError, TypeError):
+        pass
+
+    try:
+        return response_data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
         return ""
+
+
+def _is_openai_compat_endpoint(endpoint):
+    normalized = str(endpoint or "").strip().lower()
+    if not normalized:
+        return False
+    return normalized.endswith("/v1") or "/v1/" in normalized
+
+
+def _resolve_ollama_endpoint(endpoint):
+    normalized = str(endpoint or "").strip()
+    if not normalized:
+        return "http://localhost:11434/api/chat"
+    if normalized.lower().endswith("/v1"):
+        return normalized.rstrip("/") + "/chat/completions"
+    return normalized
 
 
 def _parse_model_json(text):
@@ -723,16 +754,34 @@ def _is_task_free_text_ready(conversation_text):
         return False
 
     if direction == "染髮":
-        required = ("dye_detail", "target_color", "current_base", "bleach_accept", "brand_priority", "restriction")
-        return all(slots.get(field) for field in required) and _has_budget_compatible_candidates(slots, text)
+        required = ("dye_detail", "target_color", "current_base", "bleach_accept", "brand_priority")
+        if not all(slots.get(field) for field in required):
+            return False
+        if _needs_tradeoff_priority(slots, text):
+            return bool(slots.get("tradeoff_priority"))
+        if _has_budget_compatible_candidates(slots, text):
+            return True
+        return slots.get("tradeoff_priority") == "以效果為優先" and len(_candidate_services_for_task_slots(slots)) > 0
 
     if direction == "燙髮":
-        required = ("perm_detail", "perm_bleached_history", "restriction")
-        return all(slots.get(field) for field in required) and _has_budget_compatible_candidates(slots, text)
+        required = ("perm_detail", "perm_bleached_history")
+        if not all(slots.get(field) for field in required):
+            return False
+        if _needs_tradeoff_priority(slots, text):
+            return bool(slots.get("tradeoff_priority"))
+        if _has_budget_compatible_candidates(slots, text):
+            return True
+        return slots.get("tradeoff_priority") == "以效果為優先" and len(_candidate_services_for_task_slots(slots)) > 0
 
     if direction == "護髮":
-        required = ("treatment_detail", "restriction")
-        return all(slots.get(field) for field in required) and _has_budget_compatible_candidates(slots, text)
+        required = ("treatment_detail",)
+        if not all(slots.get(field) for field in required):
+            return False
+        if _needs_tradeoff_priority(slots, text):
+            return bool(slots.get("tradeoff_priority"))
+        if _has_budget_compatible_candidates(slots, text):
+            return True
+        return slots.get("tradeoff_priority") == "以效果為優先" and len(_candidate_services_for_task_slots(slots)) > 0
 
     return False
 
@@ -808,8 +857,8 @@ def _next_task_free_text_question(conversation_text):
             return "你這次更重視染後髮質修護，還是顏色表現與CP值？"
         if not slots.get("budget_range"):
             return "你的預算價位區間大約在哪裡？例如 1200以下、1201-1800、1801-2400、2401以上。"
-        if not slots.get("restriction"):
-            return "你是否還有時間或價格上的限制？"
+        if _needs_tradeoff_priority(slots, text) and not slots.get("tradeoff_priority"):
+            return "看起來預算與效果偏好有取捨，你想優先哪一個：預算，還是效果？"
         if not _has_budget_compatible_candidates(slots, text):
             return "目前預算可能和條件不一致，你想提高預算，還是調整服務需求？"
         return "收到，我會根據你的條件整理最適合的服務方案。"
@@ -821,8 +870,8 @@ def _next_task_free_text_question(conversation_text):
             return "你有漂過頭髮嗎？"
         if not slots.get("budget_range"):
             return "你的預算價位區間大約在哪裡？例如 1200以下、1201-1800、1801-2400、2401以上。"
-        if not slots.get("restriction"):
-            return "你是否還有時間或價格上的限制？"
+        if _needs_tradeoff_priority(slots, text) and not slots.get("tradeoff_priority"):
+            return "看起來預算與效果偏好有取捨，你想優先哪一個：預算，還是效果？"
         if not _has_budget_compatible_candidates(slots, text):
             return "目前預算可能和條件不一致，你想提高預算，還是調整服務需求？"
         return "收到，我會根據你的條件整理最適合的服務方案。"
@@ -832,8 +881,8 @@ def _next_task_free_text_question(conversation_text):
             return "你這次最想改善哪種髮絲狀況：受損修護、柔順抗毛躁，還是日常保養？"
         if not slots.get("budget_range"):
             return "你的預算價位區間大約在哪裡？例如 1200以下、1201-1800。"
-        if not slots.get("restriction"):
-            return "你是否還有時間或價格上的限制？"
+        if _needs_tradeoff_priority(slots, text) and not slots.get("tradeoff_priority"):
+            return "看起來預算與效果偏好有取捨，你想優先哪一個：預算，還是效果？"
         if not _has_budget_compatible_candidates(slots, text):
             return "目前預算可能和條件不一致，你想提高預算，還是調整服務需求？"
         return "收到，我會根據你的條件整理最適合的服務方案。"
@@ -907,6 +956,8 @@ def _extract_task_slots_with_llm(normalized_text):
 
     model = os.getenv("OLLAMA_MODEL", "gemma3:4b").strip()
     endpoint = os.getenv("OLLAMA_API_URL", "http://localhost:11434/api/chat").strip()
+    resolved_endpoint = _resolve_ollama_endpoint(endpoint)
+    use_openai_compat = _is_openai_compat_endpoint(endpoint)
     schema_text = (
         "direction: 染髮|燙髮|護髮|null\n"
         "dye_detail: 全頭染|補染|漂髮設計染|null\n"
@@ -914,10 +965,10 @@ def _extract_task_slots_with_llm(normalized_text):
         "current_base: 自然黑髮|已染深色/中深色|已染淺色/已漂過|null\n"
         "bleach_accept: 可接受漂髮|希望不漂髮|null\n"
         "brand_priority: 重視染後髮質修護|重視顏色表現與CP值|null\n"
+        "tradeoff_priority: 以預算為優先|以效果為優先|我不確定|null\n"
         "perm_detail: 整體燙髮|髮根燙|燙瀏海|null\n"
         "perm_bleached_history: 有漂過|沒有漂過|null\n"
         "treatment_detail: 受損修護|柔順抗毛躁|日常保養|null\n"
-        "restriction: 時間限制|價格限制|無特別限制|null\n"
         "budget_range: 1200以下|1201-1800|1801-2400|2401以上|已提供預算|null"
     )
     system_prompt = (
@@ -925,22 +976,34 @@ def _extract_task_slots_with_llm(normalized_text):
         "將使用者語句映射到既定欄位，沒提到就填 null。"
     )
     user_prompt = f"輸入文本：{normalized_text}\n\n請依照這個 schema 回傳 JSON：\n{schema_text}"
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "format": "json",
-        "stream": False,
-        "options": {
+    if use_openai_compat:
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "stream": False,
             "temperature": 0,
-            "num_predict": 220,
-        },
-    }
+            "response_format": {"type": "json_object"},
+        }
+    else:
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "format": "json",
+            "stream": False,
+            "options": {
+                "temperature": 0,
+                "num_predict": 220,
+            },
+        }
 
     request = urllib.request.Request(
-        endpoint,
+        resolved_endpoint,
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -1057,10 +1120,14 @@ def _budget_constraint_from_budget_range(budget_range, normalized_text):
     if token == "1801-2400":
         return {"min": 1801, "max": 2400}
     if "1200" in token and "-" not in token:
-        return {"min": 0, "max": 1200}
+        return {"min": None, "max": 1200}
     if "2401" in token and "-" not in token:
         return {"min": 2401, "max": None}
-    return _parse_budget_constraint(normalized_text)
+
+    parsed = _parse_budget_constraint(normalized_text)
+    if not parsed:
+        return None
+    return {"min": parsed.get("min"), "max": parsed.get("max")}
 
 
 def _slot_value_supported_by_user_text(slot_key, value, normalized_text):
@@ -1086,10 +1153,20 @@ def _budget_value_supported_by_user_text(value, normalized_text):
     return _has_budget_info(normalized_text)
 
 
-def _budget_overlap(service_min, service_max, user_min, user_max):
-    left = user_min if user_min is not None else 0
-    right = user_max if user_max is not None else 999999
-    return service_min <= right and service_max >= left
+def _service_price_overlaps_budget(service_bounds, budget_constraint):
+    service_min = service_bounds.get("min")
+    service_max = service_bounds.get("max")
+    if service_min is None or service_max is None:
+        return False
+
+    budget_min = budget_constraint.get("min")
+    budget_max = budget_constraint.get("max")
+
+    if budget_min is not None and service_max < budget_min:
+        return False
+    if budget_max is not None and service_min > budget_max:
+        return False
+    return True
 
 
 def _filter_services_by_budget(service_names, budget_range, normalized_text):
@@ -1097,14 +1174,12 @@ def _filter_services_by_budget(service_names, budget_range, normalized_text):
     if not constraint:
         return []
 
-    user_min = constraint.get("min")
-    user_max = constraint.get("max")
     matched = []
     for service_name in service_names:
         bounds = SERVICE_PRICE_BOUNDS.get(service_name)
         if not bounds:
             continue
-        if _budget_overlap(bounds["min"], bounds["max"], user_min, user_max):
+        if _service_price_overlaps_budget(bounds, constraint):
             matched.append(service_name)
     return matched
 
@@ -1137,24 +1212,6 @@ def _rank_treatment_services_by_preference(slots, treatment_services):
         for index, bonus in bonus_map.items():
             if index < len(treatment_services):
                 scores[treatment_services[index]] += bonus
-
-    restriction = slots.get("restriction")
-    restriction_values = TASK_SLOT_ENUMS.get("restriction", ())
-    if len(restriction_values) >= 2 and restriction == restriction_values[1]:
-        # Price-sensitive users: prioritize lower price bands.
-        sorted_by_price = sorted(
-            treatment_services,
-            key=lambda name: SERVICE_PRICE_BOUNDS.get(name, {"min": 999999})["min"],
-        )
-        bonus = len(sorted_by_price)
-        for service_name in sorted_by_price:
-            scores[service_name] += bonus
-            bonus -= 1
-    elif len(restriction_values) >= 1 and restriction == restriction_values[0]:
-        # Time-sensitive users: bias toward lighter maintenance tracks.
-        if len(treatment_services) >= 3:
-            scores[treatment_services[2]] += 2
-            scores[treatment_services[1]] += 1
 
     stable_order = {name: index for index, name in enumerate(treatment_services)}
     return sorted(treatment_services, key=lambda name: (-scores.get(name, 0), stable_order.get(name, 999)))
@@ -1251,6 +1308,24 @@ def _has_budget_compatible_candidates(slots, normalized_text):
     return len(filtered) > 0
 
 
+def _needs_tradeoff_priority(slots, normalized_text):
+    direction = slots.get("direction")
+    if direction not in {"染髮", "燙髮", "護髮"}:
+        return False
+    if not slots.get("budget_range"):
+        return False
+
+    ranked_candidates = _candidate_services_for_task_slots(slots)
+    if len(ranked_candidates) < 2:
+        return False
+
+    budget_candidates = _filter_services_by_budget(ranked_candidates, slots.get("budget_range"), normalized_text)
+    if not budget_candidates:
+        return False
+
+    return ranked_candidates[0] != budget_candidates[0]
+
+
 def _build_task_text_final_output(conversation_text):
     normalized_text = _normalize_task_free_text(conversation_text)
     if not normalized_text:
@@ -1264,13 +1339,26 @@ def _build_task_text_final_output(conversation_text):
         return None
 
     filtered = _filter_services_by_budget(ranked_candidates, slots.get("budget_range"), normalized_text)
-    if not filtered:
+    if not filtered and slots.get("tradeoff_priority") != "以效果為優先":
         return None
 
-    service_name = filtered[0]
+    use_candidates = filtered
+    if _needs_tradeoff_priority(slots, normalized_text):
+        priority = slots.get("tradeoff_priority")
+        if priority == "以效果為優先":
+            use_candidates = ranked_candidates
+        elif priority in {"以預算為優先", "我不確定"}:
+            use_candidates = filtered
+        else:
+            return None
+
+    if not use_candidates:
+        return None
+
+    service_name = use_candidates[0]
     if service_name not in SERVICE_HINTS:
         return None
-    reason = _build_task_recommendation_reason(service_name, slots, normalized_text, ranked_candidates=filtered)
+    reason = _build_task_recommendation_reason(service_name, slots, normalized_text, ranked_candidates=use_candidates)
     return _final_output_for(service_name, reason=reason)
 
 
@@ -1339,6 +1427,15 @@ def _first_sentence(text):
 
 def _build_conflict_inference(slots, normalized_text):
     direction = slots.get("direction")
+    if _needs_tradeoff_priority(slots, normalized_text):
+        chosen_priority = slots.get("tradeoff_priority")
+        if chosen_priority == "以預算為優先":
+            return "你的條件在預算與效果偏好間有取捨，本次會先依你的選擇以預算為優先。"
+        if chosen_priority == "以效果為優先":
+            return "你的條件在預算與效果偏好間有取捨，本次會先依你的選擇以效果為優先。"
+        if chosen_priority == "我不確定":
+            return "你的條件在預算與效果偏好間有取捨，因為你目前未明確指定優先順序，本次先以預算可行性優先。"
+
     if direction == "染髮":
         if slots.get("target_color") == "高明度特殊色" and _has_no_bleach_constraint(slots, normalized_text):
             return "你想要高明度特殊色，但同時明確希望不漂髮，這兩個條件在技術上會互相牽制。"
@@ -1354,6 +1451,7 @@ def _build_fit_inference(service_name, slots):
     tradeoff = _first_sentence(_profile_value(service_name, "代價或取捨"))
     emphasis = slots.get("brand_priority")
     budget = slots.get("budget_range")
+    tradeoff_priority = slots.get("tradeoff_priority")
 
     if direction == "染髮":
         rationale_bits = []
@@ -1361,6 +1459,8 @@ def _build_fit_inference(service_name, slots):
             rationale_bits.append(f"你目前偏好是「{emphasis}」")
         if budget:
             rationale_bits.append(f"預算為「{budget}」")
+        if tradeoff_priority:
+            rationale_bits.append(f"你最後選擇「{tradeoff_priority}」")
         if slots.get("bleach_accept") == "希望不漂髮":
             rationale_bits.append("且有不漂髮的前提")
         basis = "、".join(rationale_bits) if rationale_bits else "你目前提供的條件"
