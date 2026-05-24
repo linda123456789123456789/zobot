@@ -109,9 +109,16 @@ TASK_SLOT_KEYWORDS = {
         "髮根燙": ("髮根燙", "髮根蓬鬆", "頭頂扁塌"),
         "燙瀏海": ("燙瀏海", "瀏海燙"),
     },
-    "perm_bleached_history": {
-        "有漂過": ("有漂過", "漂過", "曾漂過"),
-        "沒有漂過": ("沒有漂過", "沒漂過", "未漂過"),
+    "perm_blocker": {
+        "曾經漂過頭髮": ("曾經漂過頭髮", "有漂過", "漂過", "曾漂過", "漂髮過"),
+        "目前懷孕": ("目前懷孕", "懷孕中", "孕婦"),
+        "髮質嚴重受損或容易斷裂": ("髮質嚴重受損", "容易斷裂", "嚴重受損", "斷裂"),
+        "以上皆無": ("以上皆無", "都沒有", "無", "沒有"),
+    },
+    "perm_preference": {
+        "平衡預算，完成基本燙髮造型": ("平衡預算", "基本燙髮造型", "預算優先", "先求有造型"),
+        "重視燙後髮質、柔順度與修護感": ("重視燙後髮質", "柔順度", "修護感", "質感優先", "髮質優先"),
+        "不確定": ("不確定", "不確定，請用預算判斷", "都可以", "看你建議"),
     },
     "treatment_detail": {
         "受損修護": ("受損修護", "護髮修護", "深層修護", "染燙受損", "髮尾毛裂", "髮尾乾燥", "受損"),
@@ -128,9 +135,11 @@ TASK_SLOT_ENUMS = {
     "brand_priority": ("重視染後髮質修護", "重視顏色表現與CP值"),
     "tradeoff_priority": ("以預算為優先", "以效果為優先", "我不確定"),
     "perm_detail": ("整體燙髮", "髮根燙", "燙瀏海"),
-    "perm_bleached_history": ("有漂過", "沒有漂過"),
+    "perm_blocker": ("曾經漂過頭髮", "目前懷孕", "髮質嚴重受損或容易斷裂", "以上皆無"),
+    "perm_preference": ("平衡預算，完成基本燙髮造型", "重視燙後髮質、柔順度與修護感", "不確定"),
     "treatment_detail": ("受損修護", "柔順抗毛躁", "日常保養"),
 }
+PERM_HARD_BLOCKERS = {"曾經漂過頭髮", "目前懷孕", "髮質嚴重受損或容易斷裂"}
 
 
 def _service_price_bounds():
@@ -153,6 +162,11 @@ SERVICE_PRICE_BOUNDS = _service_price_bounds()
 
 
 def get_chatbot_reply(input_mode, conversation_style, message, history, system_prompt):
+    if _is_task_button_mode(input_mode, conversation_style):
+        deterministic_response = _build_task_button_ready_response(history, message)
+        if deterministic_response:
+            return deterministic_response
+
     provider = os.getenv("AI_PROVIDER", "mock").strip().lower()
     if provider == "gemini":
         return _get_gemini_reply(
@@ -179,6 +193,44 @@ def get_chatbot_reply(input_mode, conversation_style, message, history, system_p
         history=history,
         system_prompt=system_prompt,
     )
+
+
+def _build_task_button_ready_response(history, message):
+    effective_history = _history_with_latest_user_message(history, message)
+    if get_task_guided_prompt(effective_history) is not None:
+        return None
+
+    conversation_text = _conversation_text(effective_history, message)
+    final_output = _build_task_text_final_output(conversation_text) or _build_default_final_output(conversation_text)
+    if not final_output:
+        return None
+
+    return {
+        "reply": "我已根據你的需求整理出一個參考建議，請查看下方摘要。",
+        "buttons": [],
+        "source": "rule",
+        "is_final": True,
+        "final_output": final_output,
+    }
+
+
+def _history_with_latest_user_message(history, message):
+    base_history = history if isinstance(history, list) else []
+    latest_message = (message or "").strip()
+    if not latest_message:
+        return list(base_history)
+
+    if base_history:
+        last_item = base_history[-1] if isinstance(base_history[-1], dict) else {}
+        if (
+            last_item.get("role") == "user"
+            and str(last_item.get("content") or "").strip() == latest_message
+        ):
+            return list(base_history)
+
+    appended = list(base_history)
+    appended.append({"role": "user", "content": latest_message})
+    return appended
 
 
 def _get_mock_reply(input_mode, conversation_style, message, history, system_prompt):
@@ -750,10 +802,9 @@ def _is_task_free_text_ready(conversation_text):
     if direction is None:
         return False
 
-    if not slots.get("budget_range"):
-        return False
-
     if direction == "染髮":
+        if not slots.get("budget_range"):
+            return False
         required = ("dye_detail", "target_color", "current_base", "bleach_accept", "brand_priority")
         if not all(slots.get(field) for field in required):
             return False
@@ -764,8 +815,21 @@ def _is_task_free_text_ready(conversation_text):
         return slots.get("tradeoff_priority") == "以效果為優先" and len(_candidate_services_for_task_slots(slots)) > 0
 
     if direction == "燙髮":
-        required = ("perm_detail", "perm_bleached_history")
+        required = ("perm_detail", "perm_blocker")
         if not all(slots.get(field) for field in required):
+            return False
+        if slots.get("perm_blocker") in PERM_HARD_BLOCKERS:
+            return True
+        if slots.get("perm_detail") in {"髮根燙", "燙瀏海"}:
+            return True
+        if not slots.get("perm_preference"):
+            return False
+        if slots.get("perm_preference") in {
+            "平衡預算，完成基本燙髮造型",
+            "重視燙後髮質、柔順度與修護感",
+        }:
+            return True
+        if not slots.get("budget_range"):
             return False
         if _needs_tradeoff_priority(slots, text):
             return bool(slots.get("tradeoff_priority"))
@@ -774,6 +838,8 @@ def _is_task_free_text_ready(conversation_text):
         return slots.get("tradeoff_priority") == "以效果為優先" and len(_candidate_services_for_task_slots(slots)) > 0
 
     if direction == "護髮":
+        if not slots.get("budget_range"):
+            return False
         required = ("treatment_detail",)
         if not all(slots.get(field) for field in required):
             return False
@@ -798,7 +864,7 @@ def _detect_direction(text):
 
 
 def _has_budget_info(text):
-    if _has_any_phrase(text, ("預算", "價位", "以下", "以上")):
+    if _has_any_phrase(text, ("預算", "價位")):
         return True
     return re.search(r"\d{3,5}", text) is not None
 
@@ -866,8 +932,18 @@ def _next_task_free_text_question(conversation_text):
     if direction == "燙髮":
         if not slots.get("perm_detail"):
             return "你想做整體燙髮、髮根燙，還是燙瀏海？"
-        if not slots.get("perm_bleached_history"):
-            return "你有漂過頭髮嗎？"
+        if not slots.get("perm_blocker"):
+            return "是否有不可燙條件：曾經漂過頭髮、目前懷孕、髮質嚴重受損或容易斷裂、以上皆無？"
+        if slots.get("perm_blocker") in PERM_HARD_BLOCKERS:
+            return "你的條件已命中不可操作限制，這次會先提供保守建議。"
+        if slots.get("perm_detail") in {"髮根燙", "燙瀏海"}:
+            return "收到，我會根據你的條件整理最適合的服務方案。"
+        if not slots.get("perm_preference"):
+            return "若是整體燙髮，你偏向平衡預算完成基本造型，還是重視燙後髮質與修護感？"
+        if slots.get("perm_preference") == "不確定" and not slots.get("budget_range"):
+            return "若你還不確定，預算大約落在哪一段？例如 1200以下、1201-1800、1801-2400、2401以上。"
+        if slots.get("perm_preference") != "不確定":
+            return "收到，我會根據你的條件整理最適合的服務方案。"
         if not slots.get("budget_range"):
             return "你的預算價位區間大約在哪裡？例如 1200以下、1201-1800、1801-2400、2401以上。"
         if _needs_tradeoff_priority(slots, text) and not slots.get("tradeoff_priority"):
@@ -967,7 +1043,8 @@ def _extract_task_slots_with_llm(normalized_text):
         "brand_priority: 重視染後髮質修護|重視顏色表現與CP值|null\n"
         "tradeoff_priority: 以預算為優先|以效果為優先|我不確定|null\n"
         "perm_detail: 整體燙髮|髮根燙|燙瀏海|null\n"
-        "perm_bleached_history: 有漂過|沒有漂過|null\n"
+        "perm_blocker: 曾經漂過頭髮|目前懷孕|髮質嚴重受損或容易斷裂|以上皆無|null\n"
+        "perm_preference: 平衡預算，完成基本燙髮造型|重視燙後髮質、柔順度與修護感|不確定|null\n"
         "treatment_detail: 受損修護|柔順抗毛躁|日常保養|null\n"
         "budget_range: 1200以下|1201-1800|1801-2400|2401以上|已提供預算|null"
     )
@@ -1268,16 +1345,21 @@ def _candidate_services_for_task_slots(slots):
             return perm_services
 
         detail = slots.get("perm_detail")
-        history = slots.get("perm_bleached_history")
+        blocker = slots.get("perm_blocker")
+        preference = slots.get("perm_preference")
         perm_detail_values = TASK_SLOT_ENUMS.get("perm_detail", ())
-        history_values = TASK_SLOT_ENUMS.get("perm_bleached_history", ())
+
+        if blocker in PERM_HARD_BLOCKERS:
+            return []
 
         if len(perm_detail_values) >= 3 and detail == perm_detail_values[1]:
             return [perm_services[2]]
         if len(perm_detail_values) >= 3 and detail == perm_detail_values[2]:
             return [perm_services[3]]
-        if len(history_values) >= 1 and history == history_values[0]:
+        if preference == "重視燙後髮質、柔順度與修護感":
             return [perm_services[1], perm_services[0]]
+        if preference in {"平衡預算，完成基本燙髮造型", "不確定"}:
+            return [perm_services[0], perm_services[1]]
         return [perm_services[0], perm_services[1]]
 
     if direction == treatment_direction:
@@ -1310,7 +1392,7 @@ def _has_budget_compatible_candidates(slots, normalized_text):
 
 def _needs_tradeoff_priority(slots, normalized_text):
     direction = slots.get("direction")
-    if direction not in {"染髮", "燙髮", "護髮"}:
+    if direction not in {"染髮", "護髮"}:
         return False
     if not slots.get("budget_range"):
         return False
@@ -1334,9 +1416,40 @@ def _build_task_text_final_output(conversation_text):
     slots = _extract_task_slots(normalized_text)
     if _has_no_bleach_constraint(slots, normalized_text):
         slots["bleach_accept"] = "希望不漂髮"
+
+    if slots.get("direction") == "燙髮" and slots.get("perm_blocker") in PERM_HARD_BLOCKERS:
+        return _blocked_perm_final_output(slots.get("perm_blocker"))
+
     ranked_candidates = _candidate_services_for_task_slots(slots)
     if not ranked_candidates:
         return None
+
+    if slots.get("direction") == "燙髮":
+        detail = slots.get("perm_detail")
+        preference = slots.get("perm_preference")
+        if detail in {"髮根燙", "燙瀏海"}:
+            service_name = ranked_candidates[0]
+            if service_name not in SERVICE_HINTS:
+                return None
+            reason = _build_task_recommendation_reason(
+                service_name,
+                slots,
+                normalized_text,
+                ranked_candidates=ranked_candidates,
+            )
+            return _final_output_for(service_name, reason=reason)
+
+        if preference in {"平衡預算，完成基本燙髮造型", "重視燙後髮質、柔順度與修護感"}:
+            service_name = ranked_candidates[0]
+            if service_name not in SERVICE_HINTS:
+                return None
+            reason = _build_task_recommendation_reason(
+                service_name,
+                slots,
+                normalized_text,
+                ranked_candidates=ranked_candidates,
+            )
+            return _final_output_for(service_name, reason=reason)
 
     filtered = _filter_services_by_budget(ranked_candidates, slots.get("budget_range"), normalized_text)
     if not filtered and slots.get("tradeoff_priority") != "以效果為優先":
@@ -1360,6 +1473,15 @@ def _build_task_text_final_output(conversation_text):
         return None
     reason = _build_task_recommendation_reason(service_name, slots, normalized_text, ranked_candidates=use_candidates)
     return _final_output_for(service_name, reason=reason)
+
+
+def _blocked_perm_final_output(blocker):
+    blocker_text = str(blocker or "").strip() or "不可操作條件"
+    return {
+        "recommended_service": "暫不建議染燙",
+        "reason": f"你目前條件包含「{blocker_text}」，為了安全與髮況穩定，暫不建議直接進行染燙類服務。",
+        "next_step": "建議先由現場設計師評估髮況與風險，再決定是否可操作，必要時可先做修護型服務。",
+    }
 
 
 def _build_final_output(conversation_text, allow_inferred_recommendation):
@@ -1439,8 +1561,8 @@ def _build_conflict_inference(slots, normalized_text):
     if direction == "染髮":
         if slots.get("target_color") == "高明度特殊色" and _has_no_bleach_constraint(slots, normalized_text):
             return "你想要高明度特殊色，但同時明確希望不漂髮，這兩個條件在技術上會互相牽制。"
-    if direction == "燙髮" and slots.get("perm_bleached_history") == "有漂過":
-        return "你有漂髮歷史且希望燙髮，這類情境通常要更保守評估藥劑與受損風險。"
+    if direction == "燙髮" and slots.get("perm_blocker") in PERM_HARD_BLOCKERS:
+        return "你的條件命中不可操作限制，這次建議先以風險控管與現場評估為優先。"
     return ""
 
 

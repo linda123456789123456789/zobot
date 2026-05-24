@@ -13,6 +13,13 @@ CURRENT_BASE_OPTIONS = ["自然黑髮", "已染深色/中深色", "已染淺色/
 BLEACH_PREFERENCE_OPTIONS = ["可接受漂髮", "希望不漂髮", UNCERTAIN]
 COLOR_BRAND_PRIORITY_OPTIONS = ["重視染後髮質修護", "重視顏色表現與CP值", UNCERTAIN]
 TRADEOFF_PRIORITY_OPTIONS = ["以預算為優先", "以效果為優先", UNCERTAIN]
+PERM_BLOCKER_OPTIONS = ["曾經漂過頭髮", "目前懷孕", "髮質嚴重受損或容易斷裂", "以上皆無"]
+PERM_PREFERENCE_UNCERTAIN = "不確定，請用預算判斷"
+PERM_OVERALL_PREFERENCE_OPTIONS = [
+    "平衡預算，完成基本燙髮造型",
+    "重視燙後髮質、柔順度與修護感",
+    PERM_PREFERENCE_UNCERTAIN,
+]
 
 TASK_LED_STEPS = [
     {
@@ -146,19 +153,40 @@ def _detail_question_for_direction(direction):
 
 def _next_missing_slot_prompt(direction, user_messages):
     if direction == "燙髮":
-        if not _resolve_detail(direction, user_messages):
+        detail = _resolve_detail(direction, user_messages)
+        if not detail:
             return _detail_question_for_direction(direction)
-        if not _has_any(user_messages, {"有漂過", "沒有漂過", UNCERTAIN}):
-            return {"question": "你有漂過頭髮嗎？", "buttons": ["有漂過", "沒有漂過", UNCERTAIN]}
+
+        blocker = _resolve_perm_blocker(user_messages)
+        if not blocker:
+            return {"question": "是否有不可燙條件？", "buttons": PERM_BLOCKER_OPTIONS}
+        if blocker != "以上皆無":
+            return None
+
+        # Q3/Q4 only apply for overall perming.
+        if detail != "整體燙髮":
+            return None
+
+        preference = _resolve_perm_overall_preference(user_messages)
+        if not preference:
+            return {
+                "question": "若是整體燙髮，請確認服務取向。",
+                "buttons": PERM_OVERALL_PREFERENCE_OPTIONS,
+            }
+
+        if preference == "重視燙後髮質、柔順度與修護感":
+            return None
+
+        if preference == "平衡預算，完成基本燙髮造型":
+            return None
+
         if not _has_budget_range(user_messages):
             budget_options = _budget_range_options_for(direction, user_messages)
             if _has_multiple_budget_options(budget_options):
-                return {"question": "請選擇你的預算價位範圍。", "buttons": budget_options}
-        if _needs_priority_followup(direction, user_messages):
-            return {
-                "question": "看起來預算與效果偏好有取捨，你想優先哪一個？",
-                "buttons": TRADEOFF_PRIORITY_OPTIONS,
-            }
+                return {
+                    "question": "若不確定，請用預算範圍協助判斷。",
+                    "buttons": budget_options,
+                }
         return None
 
     if direction in {"染髮", "補染", "漂髮"}:
@@ -321,12 +349,22 @@ def _candidate_services_for_direction(direction, user_messages):
             return perm_services
 
         detail = _resolve_detail(direction, user_messages)
+        blocker = _resolve_perm_blocker(user_messages)
+        if blocker and blocker != "以上皆無":
+            return []
+
         if detail == "髮根燙":
             return [perm_services[2]]
         if detail == "燙瀏海":
             return [perm_services[3]]
-        if _has_any(user_messages, {"有漂過"}):
+
+        preference = _resolve_perm_overall_preference(user_messages)
+        if preference == "平衡預算，完成基本燙髮造型":
+            return [perm_services[0], perm_services[1]]
+        if preference == "重視燙後髮質、柔順度與修護感":
             return [perm_services[1], perm_services[0]]
+        if preference == PERM_PREFERENCE_UNCERTAIN:
+            return [perm_services[0], perm_services[1]]
         return [perm_services[0], perm_services[1]]
 
     if direction == "護髮":
@@ -365,7 +403,7 @@ def _needs_priority_followup(direction, user_messages):
 
 
 def _needs_budget_range_followup(user_messages):
-    selected_budget_keyword = any("預算" in (msg or "") for msg in user_messages)
+    selected_budget_keyword = any((msg or "").strip() == BUDGET_KEYWORD for msg in user_messages)
     if not selected_budget_keyword:
         return False
 
@@ -378,7 +416,7 @@ def _is_budget_range_answer(text):
         return False
     if label in DEFAULT_BUDGET_RANGE_OPTIONS:
         return True
-    return any(token in label for token in ("1200", "1800", "2400", "以下", "以上"))
+    return re.search(r"\d{3,5}", label) is not None
 
 
 def _has_budget_range(user_messages):
@@ -472,6 +510,22 @@ def _resolve_detail(direction, user_messages):
                 return option
         return None
 
+    return None
+
+
+def _resolve_perm_blocker(user_messages):
+    labels = {(msg or "").strip() for msg in user_messages}
+    for option in PERM_BLOCKER_OPTIONS:
+        if option in labels:
+            return option
+    return None
+
+
+def _resolve_perm_overall_preference(user_messages):
+    labels = {(msg or "").strip() for msg in user_messages}
+    for option in PERM_OVERALL_PREFERENCE_OPTIONS:
+        if option in labels:
+            return option
     return None
 
 
