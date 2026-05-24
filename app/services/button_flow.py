@@ -32,7 +32,7 @@ TASK_LED_STEPS = [
     },
     {
         "question": "請選擇服務細項。",
-        "buttons": ["全頭染", "補染", "漂髮設計染", UNCERTAIN],
+        "buttons": ["全頭染", "補染", UNCERTAIN],
     },
     {
         "question": "請選擇最重要的必要條件。",
@@ -139,7 +139,7 @@ def get_task_guided_prompt(history):
 
 def _detail_question_for_direction(direction):
     if direction == "染髮":
-        return {"question": "請選擇你想做的染髮類型。", "buttons": ["全頭染", "補染", "漂髮設計染", UNCERTAIN]}
+        return {"question": "請選擇你想做的染髮類型。", "buttons": ["全頭染", "補染", UNCERTAIN]}
     if direction == "燙髮":
         return {"question": "請選擇你想做的燙髮類型。", "buttons": ["整體燙髮", "髮根燙", "燙瀏海", UNCERTAIN]}
     if direction == "護髮":
@@ -194,8 +194,11 @@ def _next_missing_slot_prompt(direction, user_messages):
         if not detail:
             return _detail_question_for_direction(direction)
 
-        # 補染多半可直接進入預算與限制，不強制再問色系與底色。
-        if detail != "補染":
+        if detail == "補染":
+            return None
+
+        # 全頭染才需要追問顏色、底色與是否可漂。
+        if detail == "全頭染":
             if not _has_any(user_messages, set(COLOR_TARGET_OPTIONS)):
                 return {"question": "請選擇你想要的染後顏色。", "buttons": COLOR_TARGET_OPTIONS}
             if not _has_any(user_messages, set(CURRENT_BASE_OPTIONS)):
@@ -205,6 +208,8 @@ def _next_missing_slot_prompt(direction, user_messages):
                     "question": "依你提供的色系與底色，可能需要漂髮，你可接受嗎？",
                     "buttons": BLEACH_PREFERENCE_OPTIONS,
                 }
+            if _likely_need_bleach(user_messages) and _pick_first(user_messages, set(BLEACH_PREFERENCE_OPTIONS)) == "可接受漂髮":
+                return None
             if not _has_any(user_messages, set(COLOR_BRAND_PRIORITY_OPTIONS)):
                 return {
                     "question": "你這次更重視哪一點？",
@@ -320,16 +325,12 @@ def _candidate_services_for_direction(direction, user_messages):
         detail = _resolve_detail(direction, user_messages)
         if detail == "補染":
             return [dye_services[2]]
-        if detail == "漂髮設計染":
-            return [dye_services[3]]
-
-        target_color = _pick_first(user_messages, set(COLOR_TARGET_OPTIONS))
         bleach_accept = _pick_first(user_messages, set(BLEACH_PREFERENCE_OPTIONS))
         brand_priority = _pick_first(user_messages, set(COLOR_BRAND_PRIORITY_OPTIONS))
+        if detail == "全頭染" and _likely_need_bleach(user_messages) and bleach_accept == "可接受漂髮":
+            return [dye_services[3]]
 
         candidates = []
-        if target_color == "高明度特殊色" and bleach_accept == "可接受漂髮":
-            candidates.append(dye_services[3])
         if brand_priority == "重視染後髮質修護":
             candidates.extend([dye_services[1], dye_services[0]])
         elif brand_priority == "重視顏色表現與CP值":
@@ -455,8 +456,6 @@ def _budget_range_options_for(direction, user_messages):
             return ["1201-1800", "1801-2400", "2401 以上", UNCERTAIN]
         if detail == "補染":
             return ["1200 以下", "1201-1800", UNCERTAIN]
-        if detail == "漂髮設計染":
-            return ["1201-1800", "1801-2400", "2401 以上", UNCERTAIN]
         return ["1200 以下", "1201-1800", "1801-2400", "2401 以上", UNCERTAIN]
 
     if direction == "護髮":
@@ -499,9 +498,11 @@ def _resolve_detail(direction, user_messages):
         return None
 
     if direction in {"染髮", "補染", "漂髮"}:
-        for option in ("全頭染", "補染", "漂髮設計染"):
+        for option in ("全頭染", "補染"):
             if option in labels:
                 return option
+        if "漂髮設計染" in labels:
+            return "全頭染"
         return None
 
     if direction == "護髮":

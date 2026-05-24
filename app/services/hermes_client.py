@@ -803,10 +803,27 @@ def _is_task_free_text_ready(conversation_text):
         return False
 
     if direction == "染髮":
-        if not slots.get("budget_range"):
+        detail = _normalized_dye_detail(slots.get("dye_detail"))
+        if not detail:
             return False
-        required = ("dye_detail", "target_color", "current_base", "bleach_accept", "brand_priority")
+        if detail == "補染":
+            return True
+        if detail != "全頭染":
+            return False
+        required = ("target_color", "current_base")
         if not all(slots.get(field) for field in required):
+            return False
+        if _needs_bleach_for_slots(slots):
+            if not slots.get("bleach_accept"):
+                return False
+            if slots.get("bleach_accept") == "可接受漂髮":
+                return True
+        if not slots.get("brand_priority"):
+            return False
+        candidates = _candidate_services_for_task_slots(slots)
+        if len(candidates) <= 1:
+            return True
+        if not slots.get("budget_range"):
             return False
         if _needs_tradeoff_priority(slots, text):
             return bool(slots.get("tradeoff_priority"))
@@ -912,15 +929,25 @@ def _next_task_free_text_question(conversation_text):
 
     if direction == "染髮":
         if not slots.get("dye_detail"):
-            return "你這次染髮比較接近全頭染、補染，還是漂髮設計染？"
+            return "你這次染髮比較接近全頭染，還是補染？"
+        detail = _normalized_dye_detail(slots.get("dye_detail"))
+        if detail == "補染":
+            return "收到，我會根據你的條件整理最適合的服務方案。"
+        if detail != "全頭染":
+            return "你這次染髮比較接近全頭染，還是補染？"
         if not slots.get("target_color"):
             return "你想染後的顏色比較接近自然深色、一般棕色，還是高明度特殊色？"
         if not slots.get("current_base"):
             return "你目前的髮色底色是自然黑髮、已染深色/中深色，還是已染淺色/已漂過？"
-        if not slots.get("bleach_accept"):
+        if _needs_bleach_for_slots(slots) and not slots.get("bleach_accept"):
             return "若達到目標色可能需要漂髮，你可以接受嗎？"
+        if _needs_bleach_for_slots(slots) and slots.get("bleach_accept") == "可接受漂髮":
+            return "收到，我會根據你的條件整理最適合的服務方案。"
         if not slots.get("brand_priority"):
             return "你這次更重視染後髮質修護，還是顏色表現與CP值？"
+        candidates = _candidate_services_for_task_slots(slots)
+        if len(candidates) <= 1:
+            return "收到，我會根據你的條件整理最適合的服務方案。"
         if not slots.get("budget_range"):
             return "你的預算價位區間大約在哪裡？例如 1200以下、1201-1800、1801-2400、2401以上。"
         if _needs_tradeoff_priority(slots, text) and not slots.get("tradeoff_priority"):
@@ -1294,6 +1321,24 @@ def _rank_treatment_services_by_preference(slots, treatment_services):
     return sorted(treatment_services, key=lambda name: (-scores.get(name, 0), stable_order.get(name, 999)))
 
 
+def _normalized_dye_detail(detail):
+    if detail == "漂髮設計染":
+        return "全頭染"
+    return detail
+
+
+def _needs_bleach_for_slots(slots):
+    target = slots.get("target_color")
+    current = slots.get("current_base")
+    if not target or not current:
+        return False
+    if target == "高明度特殊色":
+        return True
+    if target == "一般棕色" and current == "自然黑髮":
+        return True
+    return False
+
+
 def _candidate_services_for_task_slots(slots):
     direction = slots.get("direction")
     direction_values = TASK_SLOT_ENUMS.get("direction", ())
@@ -1307,25 +1352,18 @@ def _candidate_services_for_task_slots(slots):
         if len(dye_services) < 4:
             return dye_services
 
-        detail = slots.get("dye_detail")
-        target_color = slots.get("target_color")
+        detail = _normalized_dye_detail(slots.get("dye_detail"))
         bleach_accept = slots.get("bleach_accept")
         brand_priority = slots.get("brand_priority")
         dye_detail_values = TASK_SLOT_ENUMS.get("dye_detail", ())
-        target_color_values = TASK_SLOT_ENUMS.get("target_color", ())
-        bleach_values = TASK_SLOT_ENUMS.get("bleach_accept", ())
         brand_values = TASK_SLOT_ENUMS.get("brand_priority", ())
 
-        if len(dye_detail_values) >= 3 and detail == dye_detail_values[1]:
+        if len(dye_detail_values) >= 2 and detail == dye_detail_values[1]:
             return [dye_services[2]]
-        if len(dye_detail_values) >= 3 and detail == dye_detail_values[2]:
+        if detail == "全頭染" and _needs_bleach_for_slots(slots) and bleach_accept == "可接受漂髮":
             return [dye_services[3]]
 
         candidates = []
-        if len(target_color_values) >= 3 and target_color == target_color_values[2]:
-            if len(bleach_values) >= 1 and bleach_accept == bleach_values[0]:
-                candidates.append(dye_services[3])
-
         if len(brand_values) >= 2 and brand_priority == brand_values[0]:
             candidates.extend([dye_services[1], dye_services[0]])
         elif len(brand_values) >= 2 and brand_priority == brand_values[1]:
@@ -1423,6 +1461,35 @@ def _build_task_text_final_output(conversation_text):
     ranked_candidates = _candidate_services_for_task_slots(slots)
     if not ranked_candidates:
         return None
+
+    if slots.get("direction") == "染髮" and _normalized_dye_detail(slots.get("dye_detail")) == "補染":
+        service_name = ranked_candidates[0]
+        if service_name not in SERVICE_HINTS:
+            return None
+        reason = _build_task_recommendation_reason(
+            service_name,
+            slots,
+            normalized_text,
+            ranked_candidates=ranked_candidates,
+        )
+        return _final_output_for(service_name, reason=reason)
+
+    if (
+        slots.get("direction") == "染髮"
+        and _normalized_dye_detail(slots.get("dye_detail")) == "全頭染"
+        and _needs_bleach_for_slots(slots)
+        and slots.get("bleach_accept") == "可接受漂髮"
+    ):
+        service_name = ranked_candidates[0]
+        if service_name not in SERVICE_HINTS:
+            return None
+        reason = _build_task_recommendation_reason(
+            service_name,
+            slots,
+            normalized_text,
+            ranked_candidates=ranked_candidates,
+        )
+        return _final_output_for(service_name, reason=reason)
 
     if slots.get("direction") == "燙髮":
         detail = slots.get("perm_detail")
