@@ -12,6 +12,7 @@ from app.services.service_catalog import RECOMMENDATION_RULES, SERVICE_CATEGORIE
 
 MAX_BUTTON_OPTIONS = 5
 UNCERTAIN_BUTTON_LABEL = "我不確定"
+BUDGET_NO_PREFERENCE = "預算不確定"
 TEMPLATE_REPLY_PATTERNS = (
     "自然、簡潔的下一句回覆",
     "自然, 簡潔的下一句回覆",
@@ -45,6 +46,10 @@ FREE_TEXT_NORMALIZE_MAP = {
     "布丁頭": "補染",
     "漂色": "漂髮設計染",
     "漂染": "漂髮設計染",
+    "是，主要在頭皮三公分內": "補染",
+    "是主要在頭皮三公分內": "補染",
+    "不是，超過三公分或接近全頭": "全頭染",
+    "不是超過三公分或接近全頭": "全頭染",
     "全染": "全頭染",
     "整體燙": "整體燙髮",
     "燙全頭": "整體燙髮",
@@ -201,6 +206,8 @@ def _build_task_button_ready_response(history, message):
         return None
 
     conversation_text = _conversation_text(effective_history, message)
+    if _history_has_budget_uncertain(effective_history):
+        conversation_text = f"{conversation_text} {BUDGET_NO_PREFERENCE}".strip()
     final_output = _build_task_text_final_output(conversation_text) or _build_default_final_output(conversation_text)
     if not final_output:
         return None
@@ -231,6 +238,28 @@ def _history_with_latest_user_message(history, message):
     appended = list(base_history)
     appended.append({"role": "user", "content": latest_message})
     return appended
+
+
+def _history_has_budget_uncertain(history):
+    if not isinstance(history, list):
+        return False
+    for index, item in enumerate(history):
+        if not isinstance(item, dict):
+            continue
+        if item.get("role") != "user":
+            continue
+        user_text = str(item.get("content") or "").strip()
+        if user_text not in {UNCERTAIN_BUTTON_LABEL, "不確定"}:
+            continue
+        if index <= 0:
+            continue
+        previous = history[index - 1] if isinstance(history[index - 1], dict) else {}
+        if previous.get("role") != "assistant":
+            continue
+        assistant_text = str(previous.get("content") or "")
+        if "預算" in assistant_text or "價位" in assistant_text:
+            return True
+    return False
 
 
 def _get_mock_reply(input_mode, conversation_style, message, history, system_prompt):
@@ -1141,7 +1170,7 @@ def _validate_task_slot_payload(parsed):
             validated[slot_key] = None
 
     budget = parsed.get("budget_range")
-    if isinstance(budget, str) and budget in {"1200以下", "1201-1800", "1801-2400", "2401以上", "已提供預算"}:
+    if isinstance(budget, str) and budget in {"1200以下", "1201-1800", "1801-2400", "2401以上", "已提供預算", BUDGET_NO_PREFERENCE}:
         validated["budget_range"] = budget
     else:
         validated["budget_range"] = None
@@ -1162,6 +1191,9 @@ def _detect_slot_value(text, candidates):
 def _detect_budget_range(text):
     if not _has_budget_info(text):
         return None
+
+    if _has_any_phrase(text, ("預算不確定", "價位不確定", "預算我不確定", "我不確定預算")):
+        return BUDGET_NO_PREFERENCE
 
     if _has_any_phrase(text, ("1200以下", "1200 以下", "千二以下")):
         return "1200以下"
@@ -1219,6 +1251,8 @@ def _is_specific_budget_bucket(value):
 
 def _budget_constraint_from_budget_range(budget_range, normalized_text):
     token = str(budget_range or "")
+    if token == BUDGET_NO_PREFERENCE:
+        return None
     if token == "1201-1800":
         return {"min": 1201, "max": 1800}
     if token == "1801-2400":
@@ -1249,6 +1283,8 @@ def _slot_value_supported_by_user_text(slot_key, value, normalized_text):
 def _budget_value_supported_by_user_text(value, normalized_text):
     if not value:
         return False
+    if value == BUDGET_NO_PREFERENCE:
+        return _has_any_phrase(normalized_text, ("預算不確定", "價位不確定", "預算我不確定", "我不確定預算"))
     detected = _detect_budget_range(normalized_text)
     if detected == value:
         return True
@@ -1339,6 +1375,16 @@ def _needs_bleach_for_slots(slots):
     return False
 
 
+def _is_budget_no_preference_value(budget_range, normalized_text=""):
+    token = str(budget_range or "").strip()
+    if token in {BUDGET_NO_PREFERENCE, UNCERTAIN_BUTTON_LABEL, "不確定"}:
+        return True
+    return _has_any_phrase(
+        normalized_text,
+        ("預算不確定", "價位不確定", "預算我不確定", "我不確定預算"),
+    )
+
+
 def _candidate_services_for_task_slots(slots):
     direction = slots.get("direction")
     direction_values = TASK_SLOT_ENUMS.get("direction", ())
@@ -1424,6 +1470,8 @@ def _has_budget_compatible_candidates(slots, normalized_text):
     candidates = _candidate_services_for_task_slots(slots)
     if not candidates:
         return False
+    if _is_budget_no_preference_value(budget_range, normalized_text):
+        return True
     filtered = _filter_services_by_budget(candidates, budget_range, normalized_text)
     return len(filtered) > 0
 
@@ -1433,6 +1481,8 @@ def _needs_tradeoff_priority(slots, normalized_text):
     if direction not in {"染髮", "護髮"}:
         return False
     if not slots.get("budget_range"):
+        return False
+    if _is_budget_no_preference_value(slots.get("budget_range"), normalized_text):
         return False
 
     ranked_candidates = _candidate_services_for_task_slots(slots)
@@ -1518,7 +1568,11 @@ def _build_task_text_final_output(conversation_text):
             )
             return _final_output_for(service_name, reason=reason)
 
-    filtered = _filter_services_by_budget(ranked_candidates, slots.get("budget_range"), normalized_text)
+    budget_range = slots.get("budget_range")
+    if _is_budget_no_preference_value(budget_range, normalized_text):
+        filtered = ranked_candidates
+    else:
+        filtered = _filter_services_by_budget(ranked_candidates, budget_range, normalized_text)
     if not filtered and slots.get("tradeoff_priority") != "以效果為優先":
         return None
 

@@ -13,6 +13,7 @@ CURRENT_BASE_OPTIONS = ["自然黑髮", "已染深色/中深色", "已染淺色/
 BLEACH_PREFERENCE_OPTIONS = ["可接受漂髮", "希望不漂髮", UNCERTAIN]
 COLOR_BRAND_PRIORITY_OPTIONS = ["重視染後髮質修護", "重視顏色表現與CP值", UNCERTAIN]
 TRADEOFF_PRIORITY_OPTIONS = ["以預算為優先", "以效果為優先", UNCERTAIN]
+DYE_AREA_CLARIFY_OPTIONS = ["是，主要在頭皮三公分內", "不是，超過三公分或接近全頭", UNCERTAIN]
 PERM_BLOCKER_OPTIONS = ["曾經漂過頭髮", "目前懷孕", "髮質嚴重受損或容易斷裂", "以上皆無"]
 PERM_PREFERENCE_UNCERTAIN = "不確定，請用預算判斷"
 PERM_OVERALL_PREFERENCE_OPTIONS = [
@@ -24,7 +25,7 @@ PERM_OVERALL_PREFERENCE_OPTIONS = [
 TASK_LED_STEPS = [
     {
         "question": "請選擇你這次想預約的美髮服務方向。",
-        "buttons": ["染髮", "護髮", "燙髮", UNCERTAIN],
+        "buttons": ["染髮", "護髮", "燙髮"],
     },
     {
         "question": "如果還不確定，請選擇最接近你的目標。",
@@ -108,7 +109,7 @@ def get_task_guided_prompt(history):
     if turn <= 0:
         return {
             "question": "請選擇你這次想預約的美髮服務方向。",
-            "buttons": ["染髮", "護髮", "燙髮", UNCERTAIN],
+            "buttons": ["染髮", "護髮", "燙髮"],
         }
 
     direction = _resolve_direction(user_messages)
@@ -192,6 +193,11 @@ def _next_missing_slot_prompt(direction, user_messages):
     if direction in {"染髮", "補染", "漂髮"}:
         detail = _resolve_detail(direction, user_messages)
         if not detail:
+            if _should_ask_dye_area_clarification(direction, user_messages):
+                return {
+                    "question": "你想染的範圍主要在頭皮三公分內嗎？",
+                    "buttons": DYE_AREA_CLARIFY_OPTIONS,
+                }
             return _detail_question_for_direction(direction)
 
         if detail == "補染":
@@ -199,18 +205,18 @@ def _next_missing_slot_prompt(direction, user_messages):
 
         # 全頭染才需要追問顏色、底色與是否可漂。
         if detail == "全頭染":
-            if not _has_any(user_messages, set(COLOR_TARGET_OPTIONS)):
+            if not _has_any_non_uncertain(user_messages, COLOR_TARGET_OPTIONS):
                 return {"question": "請選擇你想要的染後顏色。", "buttons": COLOR_TARGET_OPTIONS}
-            if not _has_any(user_messages, set(CURRENT_BASE_OPTIONS)):
+            if not _has_any_non_uncertain(user_messages, CURRENT_BASE_OPTIONS):
                 return {"question": "請選擇你目前的髮色底色。", "buttons": CURRENT_BASE_OPTIONS}
-            if _likely_need_bleach(user_messages) and not _has_any(user_messages, set(BLEACH_PREFERENCE_OPTIONS)):
+            if _likely_need_bleach(user_messages) and not _has_any_non_uncertain(user_messages, BLEACH_PREFERENCE_OPTIONS):
                 return {
                     "question": "依你提供的色系與底色，可能需要漂髮，你可接受嗎？",
                     "buttons": BLEACH_PREFERENCE_OPTIONS,
                 }
             if _likely_need_bleach(user_messages) and _pick_first(user_messages, set(BLEACH_PREFERENCE_OPTIONS)) == "可接受漂髮":
                 return None
-            if not _has_any(user_messages, set(COLOR_BRAND_PRIORITY_OPTIONS)):
+            if not _has_any_non_uncertain(user_messages, COLOR_BRAND_PRIORITY_OPTIONS):
                 return {
                     "question": "你這次更重視哪一點？",
                     "buttons": COLOR_BRAND_PRIORITY_OPTIONS,
@@ -434,6 +440,11 @@ def _has_any(user_messages, candidates):
     return any(candidate in normalized for candidate in candidates)
 
 
+def _has_any_non_uncertain(user_messages, candidates):
+    normalized_candidates = [option for option in (candidates or []) if option not in UNCERTAIN_ALIASES]
+    return _has_any(user_messages, set(normalized_candidates))
+
+
 def _budget_range_options_for(direction, user_messages):
     ranked_candidates = _candidate_services_for_direction(direction, user_messages)
     dynamic_options = _budget_range_options_from_candidates(ranked_candidates)
@@ -501,6 +512,10 @@ def _resolve_detail(direction, user_messages):
         for option in ("全頭染", "補染"):
             if option in labels:
                 return option
+        if "是，主要在頭皮三公分內" in labels:
+            return "補染"
+        if "不是，超過三公分或接近全頭" in labels:
+            return "全頭染"
         if "漂髮設計染" in labels:
             return "全頭染"
         return None
@@ -542,6 +557,15 @@ def _likely_need_bleach(user_messages):
     if target == "一般棕色" and current == "自然黑髮":
         return True
     return False
+
+
+def _should_ask_dye_area_clarification(direction, user_messages):
+    if direction not in {"染髮", "補染", "漂髮"}:
+        return False
+    if not user_messages:
+        return False
+    last_answer = (user_messages[-1] or "").strip()
+    return last_answer in UNCERTAIN_ALIASES
 
 
 def _pick_first(user_messages, candidates):
