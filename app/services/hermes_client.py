@@ -32,6 +32,7 @@ def _debug_log(event, **fields):
 FREE_TEXT_NORMALIZE_MAP = {
     "染頭髮": "染髮",
     "染发": "染髮",
+    "染法": "染髮",
     "染頭毛": "染髮",
     "換髮色": "染髮",
     "換顏色": "染髮",
@@ -103,6 +104,7 @@ TASK_SLOT_KEYWORDS = {
     "brand_priority": {
         "重視染後髮質修護": ("重視染後髮質修護", "髮質修護", "比較護髮", "髮質優先"),
         "重視顏色表現與CP值": ("重視顏色表現與CP值", "顏色表現", "cp值", "價格優先", "預算優先"),
+        "兩者都重視": ("兩者都重視", "都想要", "兩個都想要", "都重要", "都可以", "看你建議"),
     },
     "tradeoff_priority": {
         "以預算為優先": ("以預算為優先", "以價位為優先", "價位優先", "預算優先", "以預算為主", "以價格為主"),
@@ -137,7 +139,7 @@ TASK_SLOT_ENUMS = {
     "target_color": ("自然深色", "一般棕色", "高明度特殊色"),
     "current_base": ("自然黑髮", "已染深色/中深色", "已染淺色/已漂過"),
     "bleach_accept": ("可接受漂髮", "希望不漂髮"),
-    "brand_priority": ("重視染後髮質修護", "重視顏色表現與CP值"),
+    "brand_priority": ("重視染後髮質修護", "重視顏色表現與CP值", "兩者都重視"),
     "tradeoff_priority": ("以預算為優先", "以效果為優先", "我不確定"),
     "perm_detail": ("整體燙髮", "髮根燙", "燙瀏海"),
     "perm_blocker": ("曾經漂過頭髮", "目前懷孕", "髮質嚴重受損或容易斷裂", "以上皆無"),
@@ -441,6 +443,22 @@ def _get_ollama_reply(input_mode, conversation_style, message, history, system_p
             conversation_style=conversation_style,
             raw_preview=(text or "")[:180],
         )
+        natural_reply = _sanitize_template_reply(str(text or "").strip())
+        if natural_reply:
+            fallback_response = {
+                "reply": natural_reply,
+                "buttons": [],
+                "source": "ollama_fallback_text",
+                "is_final": False,
+                "final_output": None,
+            }
+            return _force_final_at_turn_limit(
+                fallback_response,
+                input_mode=input_mode,
+                conversation_style=conversation_style,
+                message=message,
+                history=history,
+            )
         return _ai_error_reply("本機 AI 回覆格式暫時無法解析，請再試一次。")
 
     model_response = _normalize_model_result(parsed, input_mode, source="ollama")
@@ -597,18 +615,19 @@ def _force_final_at_turn_limit(model_response, input_mode, conversation_style, m
             history=history,
             message=message,
         )
+        guarded_is_final = bool(model_response.get("is_final")) and bool(task_ready)
         _debug_log(
             "task_mode_guard",
             input_mode=input_mode,
             task_ready=task_ready,
-            is_final=model_response.get("is_final"),
+            is_final=guarded_is_final,
             reply_preview=(model_response.get("reply") or "")[:120],
         )
 
     if model_response["is_final"]:
         if task_mode and not task_ready:
             return {
-                "reply": _next_task_free_text_question(_conversation_text(history, message)),
+                "reply": _next_task_free_text_question(_conversation_text(history, message), message),
                 "buttons": model_response.get("buttons") or [],
                 "source": model_response.get("source"),
                 "is_final": False,
@@ -626,7 +645,7 @@ def _force_final_at_turn_limit(model_response, input_mode, conversation_style, m
                     "final_output": final_output,
                 }
             return {
-                "reply": _next_task_free_text_question(conversation_text),
+                "reply": _next_task_free_text_question(conversation_text, message),
                 "buttons": [],
                 "source": model_response.get("source"),
                 "is_final": False,
@@ -644,7 +663,7 @@ def _force_final_at_turn_limit(model_response, input_mode, conversation_style, m
                     "final_output": final_output,
                 }
             return {
-                "reply": _next_task_free_text_question(conversation_text),
+                "reply": _next_task_free_text_question(conversation_text, message),
                 "buttons": model_response.get("buttons") or [],
                 "source": model_response.get("source"),
                 "is_final": False,
@@ -667,7 +686,7 @@ def _force_final_at_turn_limit(model_response, input_mode, conversation_style, m
                     "final_output": final_output,
                 }
             return {
-                "reply": _next_task_free_text_question(conversation_text),
+                "reply": _next_task_free_text_question(conversation_text, message),
                 "buttons": [],
                 "source": model_response.get("source"),
                 "is_final": False,
@@ -920,6 +939,24 @@ def _has_any_phrase(text, phrases):
     return any((phrase or "").lower() in lowered for phrase in phrases)
 
 
+def _is_affirmative_reply_text(text):
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return False
+    tokens = ("是", "對", "沒錯", "正確", "嗯", "好", "可以", "對的")
+    if lowered in tokens or any(lowered.startswith(f"{token}，") for token in tokens):
+        return True
+    return lowered.startswith(("是的", "對啊", "對喔", "沒錯啊", "可以啊"))
+
+
+def _is_negative_reply_text(text):
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return False
+    tokens = ("不是", "不對", "不太對", "不正確", "不是喔", "不是哦", "no")
+    return lowered in tokens or any(lowered.startswith(f"{token}，") for token in tokens)
+
+
 def _sanitize_template_reply(reply):
     content = (reply or "").strip()
     if not content:
@@ -929,17 +966,117 @@ def _sanitize_template_reply(reply):
     return content
 
 
+def _is_difference_question(text):
+    normalized = _normalize_task_free_text(text)
+    return _has_any_phrase(
+        normalized,
+        ("差別", "差在哪", "差異", "不同", "怎麼選", "比較", "有什麼差"),
+    )
+
+
+def _is_followup_question(text):
+    normalized = _normalize_task_free_text(text)
+    return _has_any_phrase(
+        normalized,
+        ("?", "？", "為什麼", "怎麼", "需要", "要不要", "可以嗎", "會不會", "風險", "差別", "差在哪", "什麼意思", "甚麼意思"),
+    )
+
+
+def _task_followup_explanation(conversation_text, user_message):
+    text = _normalize_task_free_text(conversation_text)
+    message = _normalize_task_free_text(user_message)
+    slots = _extract_task_slots(text)
+    direction = slots.get("direction")
+    if direction != "染髮":
+        return ""
+
+    if _has_any_phrase(message, ("差別", "差在哪", "不同", "比較")):
+        return _difference_explanation_for_next_slot(conversation_text)
+
+    if _has_any_phrase(message, ("需要漂", "要不要漂", "漂髮嗎", "會不會漂", "能不能不漂")):
+        target = slots.get("target_color")
+        current = slots.get("current_base")
+        color_hint = _extract_target_color_hint(text) or "目標色"
+        if target == "高明度特殊色":
+            if current == "已染淺色/已漂過":
+                return f"以你目前底色來看，仍可能需要補漂或校色，會依{color_hint}的目標明度決定。"
+            if current == "已染深色/中深色":
+                return f"以你目前底色來看，多數情況會需要先漂，才能穩定做出{color_hint}。"
+            if current == "自然黑髮":
+                return f"若目標是{color_hint}，通常需要先漂才能顯色，否則可能偏暗或偏灰。"
+        return "是否需要漂髮會看目前底色與目標明度，現場設計師會再評估可行性與髮況風險。"
+
+    if _has_any_phrase(message, ("什麼意思", "甚麼意思")):
+        if _has_any_phrase(text, ("預算可能和條件不一致", "提高預算", "調整服務需求")):
+            return "這句話的意思是：以你目前條件，落在該預算內的可行方案可能不足，所以需要提高預算或調整需求。"
+        if _has_any_phrase(text, ("重視染後髮質修護", "顏色表現與cp值", "顏色表現與cp")):
+            return "簡單說：修護優先偏向髮質與溫和度；顏色與CP值優先偏向顯色與預算效率。"
+
+    return ""
+
+
+def _difference_explanation_for_next_slot(conversation_text):
+    text = _normalize_task_free_text(conversation_text)
+    slots = _extract_task_slots(text)
+    direction = slots.get("direction")
+
+    if direction == "染髮":
+        detail = _normalized_dye_detail(slots.get("dye_detail"))
+        if not slots.get("dye_detail") or detail not in {"全頭染", "補染"}:
+            return "全頭染是整頭換色；補染主要針對新生髮根或局部色差。"
+        if detail == "全頭染" and not slots.get("target_color"):
+            return "自然深色通常較低調、維護門檻較低；高明度特殊色更顯色，常需要更多前置處理。"
+        if detail == "全頭染" and not slots.get("current_base"):
+            return "目前底色會直接影響可達到的明度、是否需要漂髮，以及最終持色表現。"
+        if detail == "全頭染" and _needs_bleach_for_slots(slots) and not slots.get("bleach_accept"):
+            return "可接受漂髮通常顏色選擇更多；不漂髮會改走更保守、髮質負擔較低的方向。"
+        if detail == "全頭染" and not slots.get("brand_priority"):
+            return "重視髮質修護會偏向較溫和與修護導向；重視顏色表現與CP值則偏向顯色與預算效率。"
+        if not slots.get("budget_range"):
+            return "預算會影響可優先比對的方案範圍，先確認可更快收斂到可預約方案。"
+
+    if direction == "燙髮":
+        if not slots.get("perm_detail"):
+            return "整體燙髮是改變整體捲度；髮根燙主攻頭頂蓬鬆；燙瀏海是局部微調。"
+        if not slots.get("perm_blocker"):
+            return "這題是安全檢查：若有漂髮、懷孕或嚴重受損，通常要先走保守評估。"
+        if slots.get("perm_detail") == "整體燙髮" and not slots.get("perm_preference"):
+            return "平衡預算偏向先完成造型；重視修護感會偏向燙後髮質與觸感。"
+        if not slots.get("budget_range"):
+            return "預算能幫我們在可行方案裡快速收斂，不會推薦到不符合價位的服務。"
+
+    if direction == "護髮":
+        if not slots.get("treatment_detail"):
+            return "受損修護偏重結構修補；柔順抗毛躁偏重觸感與服貼；日常保養偏入門維持。"
+        if not slots.get("budget_range"):
+            return "預算能幫我們在護髮方案中更快對齊可預約選項。"
+
+    return ""
+
+
 def _guard_task_reply_if_not_ready(reply, ready, input_mode, history, message):
     content = _sanitize_template_reply(reply)
     if ready:
         return content
 
     if input_mode == "text":
-        return _next_task_free_text_question(_conversation_text(history, message))
+        conversation_text = _conversation_text(history, message)
+        next_question = _next_task_free_text_question(conversation_text, message)
+        if _is_followup_question(message):
+            explanation = _task_followup_explanation(conversation_text, message)
+            ai_reply = content.strip()
+            if _looks_like_recommendation_text(ai_reply):
+                ai_reply = ""
+            base_reply = ai_reply or explanation
+            if base_reply:
+                if next_question and next_question not in base_reply:
+                    return f"{base_reply}\n\n{next_question}"
+                return base_reply
+        return next_question
 
     if _contains_service_name(content):
-        return _next_task_free_text_question(_conversation_text(history, message))
-    return content or _next_task_free_text_question(_conversation_text(history, message))
+        return _next_task_free_text_question(_conversation_text(history, message), message)
+    return content or _next_task_free_text_question(_conversation_text(history, message), message)
 
 
 def _contains_service_name(text):
@@ -949,7 +1086,30 @@ def _contains_service_name(text):
     return any(service_name in content for service_name in SERVICE_HINTS.keys())
 
 
-def _next_task_free_text_question(conversation_text):
+def _looks_like_recommendation_text(text):
+    content = (text or "").strip()
+    if not content:
+        return False
+    if _has_any_phrase(content, ("推薦服務", "推薦理由", "注意事項", "請參考此建議")):
+        return True
+    return _contains_service_name(content) and _has_any_phrase(content, ("推薦", "建議"))
+
+
+def _extract_target_color_hint(normalized_text):
+    content = (normalized_text or "").lower()
+    if not content:
+        return ""
+    color_tokens = (
+        "藍色", "藍", "粉色", "粉紅", "銀色", "銀", "金色", "金", "紫色", "紫",
+        "橘色", "橘", "紅色", "紅", "灰色", "灰", "黑色", "黑", "棕色", "棕",
+    )
+    for token in color_tokens:
+        if token in content:
+            return token
+    return ""
+
+
+def _next_task_free_text_question(conversation_text, latest_user_message=""):
     text = _normalize_task_free_text(conversation_text)
     slots = _extract_task_slots(text)
     direction = slots.get("direction")
@@ -967,7 +1127,13 @@ def _next_task_free_text_question(conversation_text):
         if not slots.get("target_color"):
             return "你想染後的顏色比較接近自然深色、一般棕色，還是高明度特殊色？"
         if not slots.get("current_base"):
-            return "你目前的髮色底色是自然黑髮、已染深色/中深色，還是已染淺色/已漂過？"
+            candidate_base = _infer_current_base_candidate_from_text(text)
+            if candidate_base and _is_affirmative_reply_text(latest_user_message):
+                slots["current_base"] = candidate_base
+            elif candidate_base and not _is_negative_reply_text(latest_user_message):
+                return f"你目前底色比較像「{candidate_base}」，這樣對嗎？"
+            else:
+                return "你目前的髮色底色是自然黑髮、已染深色/中深色，還是已染淺色/已漂過？"
         if _needs_bleach_for_slots(slots) and not slots.get("bleach_accept"):
             return "若達到目標色可能需要漂髮，你可以接受嗎？"
         if _needs_bleach_for_slots(slots) and slots.get("bleach_accept") == "可接受漂髮":
@@ -1022,6 +1188,107 @@ def _next_task_free_text_question(conversation_text):
     return "我需要再確認一個條件，才能準確推薦。你目前最在意的是預算、時間，還是髮況限制？"
 
 
+def _next_required_slot_for_slots(slots, normalized_text):
+    direction = (slots or {}).get("direction")
+    if not direction:
+        return "direction"
+
+    if direction == "染髮":
+        detail = _normalized_dye_detail((slots or {}).get("dye_detail"))
+        if not detail:
+            return "dye_detail"
+        if detail == "補染":
+            return None
+        if detail != "全頭染":
+            return "dye_detail"
+        if not (slots or {}).get("target_color"):
+            return "target_color"
+        if not (slots or {}).get("current_base"):
+            return "current_base"
+        if _needs_bleach_for_slots(slots) and not (slots or {}).get("bleach_accept"):
+            return "bleach_accept"
+        if _needs_bleach_for_slots(slots) and (slots or {}).get("bleach_accept") == "可接受漂髮":
+            return None
+        if not (slots or {}).get("brand_priority"):
+            return "brand_priority"
+        candidates = _candidate_services_for_task_slots(slots)
+        if len(candidates) <= 1:
+            return None
+        if not (slots or {}).get("budget_range"):
+            return "budget_range"
+        if _needs_tradeoff_priority(slots, normalized_text) and not (slots or {}).get("tradeoff_priority"):
+            return "tradeoff_priority"
+        if not _has_budget_compatible_candidates(slots, normalized_text):
+            return "budget_adjustment"
+        return None
+
+    if direction == "燙髮":
+        if not (slots or {}).get("perm_detail"):
+            return "perm_detail"
+        if not (slots or {}).get("perm_blocker"):
+            return "perm_blocker"
+        if (slots or {}).get("perm_blocker") in PERM_HARD_BLOCKERS:
+            return None
+        if (slots or {}).get("perm_detail") in {"髮根燙", "燙瀏海"}:
+            return None
+        if not (slots or {}).get("perm_preference"):
+            return "perm_preference"
+        if (slots or {}).get("perm_preference") != "不確定":
+            return None
+        if not (slots or {}).get("budget_range"):
+            return "budget_range"
+        if _needs_tradeoff_priority(slots, normalized_text) and not (slots or {}).get("tradeoff_priority"):
+            return "tradeoff_priority"
+        if not _has_budget_compatible_candidates(slots, normalized_text):
+            return "budget_adjustment"
+        return None
+
+    if direction == "護髮":
+        if not (slots or {}).get("treatment_detail"):
+            return "treatment_detail"
+        if not (slots or {}).get("budget_range"):
+            return "budget_range"
+        if _needs_tradeoff_priority(slots, normalized_text) and not (slots or {}).get("tradeoff_priority"):
+            return "tradeoff_priority"
+        if not _has_budget_compatible_candidates(slots, normalized_text):
+            return "budget_adjustment"
+        return None
+
+    return None
+
+
+def _is_uncertain_reply_text(normalized_text):
+    return _has_any_phrase(
+        normalized_text,
+        ("都可以", "我不確定", "不確定", "看你建議", "都行", "隨便", "沒差", "都想要"),
+    )
+
+
+def _clear_cross_direction_slots(slots):
+    direction = (slots or {}).get("direction")
+    if direction == "染髮":
+        slots["perm_detail"] = None
+        slots["perm_blocker"] = None
+        slots["perm_preference"] = None
+        slots["treatment_detail"] = None
+    elif direction == "燙髮":
+        slots["dye_detail"] = None
+        slots["target_color"] = None
+        slots["current_base"] = None
+        slots["bleach_accept"] = None
+        slots["brand_priority"] = None
+        slots["treatment_detail"] = None
+    elif direction == "護髮":
+        slots["dye_detail"] = None
+        slots["target_color"] = None
+        slots["current_base"] = None
+        slots["bleach_accept"] = None
+        slots["brand_priority"] = None
+        slots["perm_detail"] = None
+        slots["perm_blocker"] = None
+        slots["perm_preference"] = None
+
+
 def _normalize_task_free_text(text):
     normalized = (text or "").strip()
     if not normalized:
@@ -1057,24 +1324,67 @@ def _extract_task_slots_cached(normalized_text):
         return rule_slots
 
     merged = dict(rule_slots)
+    llm_confidence = {}
     for slot_key in TASK_SLOT_ENUMS:
         llm_value = llm_slots.get(slot_key)
-        if llm_value in TASK_SLOT_ENUMS[slot_key] and _slot_value_supported_by_user_text(slot_key, llm_value, normalized_text):
+        if llm_value not in TASK_SLOT_ENUMS[slot_key]:
+            continue
+        if slot_key == "bleach_accept":
+            explicit_bleach = _infer_bleach_accept_from_text(normalized_text)
+            # Explicit user stance wins; question intent should not auto-fill accept.
+            if explicit_bleach:
+                merged[slot_key] = explicit_bleach
+            elif not _is_bleach_question_text(normalized_text):
+                merged[slot_key] = llm_value
+            continue
+        if slot_key == "target_color":
+            confidence = _llm_target_color_confidence(llm_value, normalized_text)
+            llm_confidence[slot_key] = confidence
             merged[slot_key] = llm_value
+            continue
+        if slot_key == "current_base":
+            confidence = _llm_current_base_confidence(llm_value, normalized_text)
+            llm_confidence[slot_key] = confidence
+            merged[slot_key] = llm_value
+            continue
+        merged[slot_key] = llm_value
 
     llm_budget = llm_slots.get("budget_range")
-    merged_budget = merged.get("budget_range")
-    if (not merged_budget or not _is_specific_budget_bucket(merged_budget)) and llm_budget:
-        if _budget_value_supported_by_user_text(llm_budget, normalized_text):
-            merged["budget_range"] = llm_budget
-        else:
-            merged["budget_range"] = merged_budget or rule_slots.get("budget_range")
+    if llm_budget:
+        merged["budget_range"] = llm_budget
+    elif not merged.get("budget_range"):
+        merged["budget_range"] = rule_slots.get("budget_range")
+
+    # Backfill direction when user wording is implicit (e.g. "全頭染粉色頭髮")
+    # but downstream dye/perm/treatment slots are already clear.
+    if not merged.get("direction"):
+        inferred_direction = (
+            _infer_direction_from_slot_bundle(merged)
+            or _infer_direction_from_slot_bundle(llm_slots)
+            or _infer_direction_from_slot_bundle(rule_slots)
+        )
+        if inferred_direction:
+            merged["direction"] = inferred_direction
+
+    _clear_cross_direction_slots(merged)
+
+    # Let uncertain answers only fill the currently required slot.
+    required_slot = _next_required_slot_for_slots(merged, normalized_text)
+    if _is_uncertain_reply_text(normalized_text):
+        if required_slot == "budget_range" and not merged.get("budget_range"):
+            merged["budget_range"] = BUDGET_NO_PREFERENCE
+        elif required_slot == "tradeoff_priority" and not merged.get("tradeoff_priority"):
+            merged["tradeoff_priority"] = "我不確定"
+        elif required_slot == "brand_priority" and not merged.get("brand_priority"):
+            merged["brand_priority"] = "兩者都重視"
 
     _debug_log(
         "slot_extract_merged",
         text_preview=normalized_text[:100],
         llm_slots=llm_slots,
         rule_slots=rule_slots,
+        llm_confidence=llm_confidence,
+        required_slot=required_slot,
         merged_slots=merged,
     )
     return merged
@@ -1096,7 +1406,7 @@ def _extract_task_slots_with_llm(normalized_text):
         "target_color: 自然深色|一般棕色|高明度特殊色|null\n"
         "current_base: 自然黑髮|已染深色/中深色|已染淺色/已漂過|null\n"
         "bleach_accept: 可接受漂髮|希望不漂髮|null\n"
-        "brand_priority: 重視染後髮質修護|重視顏色表現與CP值|null\n"
+        "brand_priority: 重視染後髮質修護|重視顏色表現與CP值|兩者都重視|null\n"
         "tradeoff_priority: 以預算為優先|以效果為優先|我不確定|null\n"
         "perm_detail: 整體燙髮|髮根燙|燙瀏海|null\n"
         "perm_blocker: 曾經漂過頭髮|目前懷孕|髮質嚴重受損或容易斷裂|以上皆無|null\n"
@@ -1163,7 +1473,7 @@ def _extract_task_slots_with_llm(normalized_text):
 def _validate_task_slot_payload(parsed):
     validated = {}
     for slot_key, allowed_values in TASK_SLOT_ENUMS.items():
-        value = parsed.get(slot_key)
+        value = _normalize_llm_slot_value(slot_key, parsed.get(slot_key))
         if isinstance(value, str) and value in allowed_values:
             validated[slot_key] = value
         else:
@@ -1176,6 +1486,47 @@ def _validate_task_slot_payload(parsed):
         validated["budget_range"] = None
 
     return validated
+
+
+def _normalize_llm_slot_value(slot_key, value):
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    lowered = text.lower()
+    if not text:
+        return value
+
+    if slot_key == "dye_detail":
+        if "補染" in text:
+            return "補染"
+        if "全頭" in text or "整頭" in text:
+            return "全頭染"
+        if "漂" in text and "染" in text:
+            return "漂髮設計染"
+
+    if slot_key == "target_color":
+        if any(token in text for token in ("粉", "金", "銀", "灰", "白金", "紫", "藍", "橘", "紅", "特殊")):
+            return "高明度特殊色"
+        if any(token in text for token in ("棕", "咖啡", "茶色", "可可")):
+            return "一般棕色"
+        if any(token in text for token in ("黑", "深色", "自然深")):
+            return "自然深色"
+
+    if slot_key == "current_base":
+        if any(token in text for token in ("自然黑", "黑髮", "原生", "沒染過", "天生黑")):
+            return "自然黑髮"
+        if any(token in text for token in ("棕", "咖啡", "茶色", "可可", "深棕", "中深", "已染深色")):
+            return "已染深色/中深色"
+        if any(token in text for token in ("金", "銀", "淺色", "漂過", "已漂", "白金", "奶金")):
+            return "已染淺色/已漂過"
+
+    if slot_key == "bleach_accept":
+        if any(token in lowered for token in ("不想漂", "不要漂", "不漂", "不考慮漂", "先不要漂", "不能漂")):
+            return "希望不漂髮"
+        if any(token in lowered for token in ("可以漂", "可漂", "接受漂", "能漂", "可接受漂", "ok漂")):
+            return "可接受漂髮"
+
+    return value
 
 
 def _detect_slot_value(text, candidates):
@@ -1192,7 +1543,21 @@ def _detect_budget_range(text):
     if not _has_budget_info(text):
         return None
 
-    if _has_any_phrase(text, ("預算不確定", "價位不確定", "預算我不確定", "我不確定預算")):
+    if _has_any_phrase(
+        text,
+        (
+            "預算不確定",
+            "價位不確定",
+            "預算我不確定",
+            "我不確定預算",
+            "預算都可以",
+            "價位都可以",
+            "預算可彈性",
+            "預算都可",
+            "價位都可",
+            "預算可以",
+        ),
+    ):
         return BUDGET_NO_PREFERENCE
 
     if _has_any_phrase(text, ("1200以下", "1200 以下", "千二以下")):
@@ -1280,11 +1645,206 @@ def _slot_value_supported_by_user_text(slot_key, value, normalized_text):
     return any((phrase or "").lower() in content for phrase in phrases)
 
 
+def _is_bleach_question_text(normalized_text):
+    content = (normalized_text or "").lower()
+    if not content:
+        return False
+    return _has_any_phrase(
+        content,
+        ("要漂嗎", "需要漂嗎", "會漂嗎", "會不會漂", "要不要漂", "漂髮嗎", "能不能不漂", "需不需要漂"),
+    )
+
+
+def _infer_bleach_accept_from_text(normalized_text):
+    content = (normalized_text or "").lower()
+    if not content:
+        return None
+
+    # explicit rejection has highest priority
+    if _has_any_phrase(
+        content,
+        (
+            "不想漂",
+            "不要漂",
+            "不想要漂髮",
+            "我還是不想要漂髮",
+            "先不要漂",
+            "不考慮漂",
+            "不能漂",
+            "不可以漂",
+        ),
+    ):
+        return "希望不漂髮"
+
+    # explicit acceptance
+    if _has_any_phrase(
+        content,
+        ("可接受漂髮", "可以漂", "可漂", "接受漂", "能漂", "ok 漂", "可以接受漂髮"),
+    ):
+        return "可接受漂髮"
+
+    # question intent should not be treated as acceptance
+    if _is_bleach_question_text(content):
+        return None
+
+    return None
+
+
+def _infer_current_base_candidate_from_text(normalized_text):
+    content = (normalized_text or "").lower()
+    if not content:
+        return None
+
+    # Prioritize explicit "current-state" phrases to avoid confusing target color with base color.
+    if not _has_any_phrase(content, ("目前", "現在", "底色", "原本", "本來", "我目前", "我現在")):
+        return None
+
+    if _has_any_phrase(
+        content,
+        ("已漂過", "漂過", "金髮", "金色頭髮", "淺色底", "淺金", "奶金", "白金", "銀髮"),
+    ):
+        return "已染淺色/已漂過"
+
+    if _has_any_phrase(
+        content,
+        ("可可棕", "棕色", "棕髮", "咖啡色", "茶色", "深棕", "中深色", "已染深色"),
+    ):
+        return "已染深色/中深色"
+
+    if _has_any_phrase(content, ("自然黑髮", "黑髮", "原生髮", "沒染過", "天生黑")):
+        return "自然黑髮"
+
+    return None
+
+
+def _infer_direction_from_slot_bundle(slot_bundle):
+    if not isinstance(slot_bundle, dict):
+        return None
+    if slot_bundle.get("dye_detail") or slot_bundle.get("target_color") or slot_bundle.get("current_base") or slot_bundle.get("bleach_accept") or slot_bundle.get("brand_priority"):
+        return "染髮"
+    if slot_bundle.get("perm_detail") or slot_bundle.get("perm_blocker") or slot_bundle.get("perm_preference"):
+        return "燙髮"
+    if slot_bundle.get("treatment_detail"):
+        return "護髮"
+    return None
+
+
+def _llm_current_base_confidence(value, normalized_text):
+    content = (normalized_text or "").lower()
+    if not value or not content:
+        return "low"
+
+    signal_map = {
+        "自然黑髮": (
+            "自然黑髮",
+            "原生黑髮",
+            "天生黑髮",
+            "沒染過",
+            "黑髮",
+            "自然髮色黑",
+        ),
+        "已染深色/中深色": (
+            "已染深色",
+            "染過深色",
+            "中深色",
+            "深色",
+            "深棕",
+            "咖啡色底",
+        ),
+        "已染淺色/已漂過": (
+            "已染淺色",
+            "淺色底",
+            "漂過",
+            "已漂",
+            "金髮",
+            "金色頭髮",
+            "金色髮",
+            "淺金",
+            "漂金",
+            "退色很淺",
+        ),
+    }
+    if _has_any_phrase(content, signal_map.get(value, ())):
+        return "high"
+    return "low"
+
+
+def _allow_llm_current_base_in_context(merged_slots, llm_slots, normalized_text):
+    merged_direction = (merged_slots or {}).get("direction")
+    llm_direction = (llm_slots or {}).get("direction")
+    if merged_direction == "染髮" or llm_direction == "染髮":
+        return True
+    return _has_any_phrase(
+        normalized_text,
+        ("目前", "現在", "底色", "髮色", "我是", "我目前是", "我現在是"),
+    )
+
+
+def _llm_target_color_confidence(value, normalized_text):
+    content = (normalized_text or "").lower()
+    if not value or not content:
+        return "low"
+
+    signal_map = {
+        "自然深色": (
+            "自然深色",
+            "自然黑",
+            "深色",
+            "黑色",
+            "深咖",
+        ),
+        "一般棕色": (
+            "棕色",
+            "咖啡色",
+            "可可棕",
+            "茶色",
+            "奶茶棕",
+            "栗子棕",
+            "棕",
+        ),
+        "高明度特殊色": (
+            "高明度",
+            "特殊色",
+            "金色",
+            "金髮",
+            "金发",
+            "銀色",
+            "灰色",
+            "白金",
+            "粉色",
+            "藍色",
+            "紫色",
+            "橘色",
+            "紅色",
+            "霧金",
+            "亞麻金",
+            "奶金",
+        ),
+    }
+    if _has_any_phrase(content, signal_map.get(value, ())):
+        return "high"
+    return "low"
+
+
 def _budget_value_supported_by_user_text(value, normalized_text):
     if not value:
         return False
     if value == BUDGET_NO_PREFERENCE:
-        return _has_any_phrase(normalized_text, ("預算不確定", "價位不確定", "預算我不確定", "我不確定預算"))
+        return _has_any_phrase(
+            normalized_text,
+            (
+                "預算不確定",
+                "價位不確定",
+                "預算我不確定",
+                "我不確定預算",
+                "預算都可以",
+                "價位都可以",
+                "預算可彈性",
+                "預算都可",
+                "價位都可",
+                "預算可以",
+            ),
+        )
     detected = _detect_budget_range(normalized_text)
     if detected == value:
         return True
@@ -1381,7 +1941,18 @@ def _is_budget_no_preference_value(budget_range, normalized_text=""):
         return True
     return _has_any_phrase(
         normalized_text,
-        ("預算不確定", "價位不確定", "預算我不確定", "我不確定預算"),
+        (
+            "預算不確定",
+            "價位不確定",
+            "預算我不確定",
+            "我不確定預算",
+            "預算都可以",
+            "價位都可以",
+            "預算可彈性",
+            "預算都可",
+            "價位都可",
+            "預算可以",
+        ),
     )
 
 
