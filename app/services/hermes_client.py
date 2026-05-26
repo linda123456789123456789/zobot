@@ -124,7 +124,18 @@ TASK_SLOT_KEYWORDS = {
     },
     "perm_preference": {
         "平衡預算，完成基本燙髮造型": ("平衡預算", "基本燙髮造型", "預算優先", "先求有造型"),
-        "重視燙後髮質、柔順度與修護感": ("重視燙後髮質", "柔順度", "修護感", "質感優先", "髮質優先"),
+        "重視燙後髮質、柔順度與修護感": (
+            "重視燙後髮質",
+            "柔順度",
+            "修護感",
+            "質感優先",
+            "髮質優先",
+            "重視髮質修護",
+            "我在意髮質",
+            "髮質很重要",
+            "重視修護",
+            "修護優先",
+        ),
         "不確定": ("不確定", "不確定，請用預算判斷", "都可以", "看你建議"),
     },
     "treatment_detail": {
@@ -1329,13 +1340,10 @@ def _extract_task_slots_cached(normalized_text):
         llm_value = llm_slots.get(slot_key)
         if llm_value not in TASK_SLOT_ENUMS[slot_key]:
             continue
-        if slot_key == "bleach_accept":
-            explicit_bleach = _infer_bleach_accept_from_text(normalized_text)
-            # Explicit user stance wins; question intent should not auto-fill accept.
-            if explicit_bleach:
-                merged[slot_key] = explicit_bleach
-            elif not _is_bleach_question_text(normalized_text):
-                merged[slot_key] = llm_value
+        # Keep rule-extracted value first; only fill from LLM when user wording supports it.
+        if merged.get(slot_key):
+            continue
+        if not _has_user_slot_evidence(slot_key, llm_value, normalized_text):
             continue
         if slot_key == "target_color":
             confidence = _llm_target_color_confidence(llm_value, normalized_text)
@@ -1350,10 +1358,8 @@ def _extract_task_slots_cached(normalized_text):
         merged[slot_key] = llm_value
 
     llm_budget = llm_slots.get("budget_range")
-    if llm_budget:
+    if not merged.get("budget_range") and llm_budget and _has_user_slot_evidence("budget_range", llm_budget, normalized_text):
         merged["budget_range"] = llm_budget
-    elif not merged.get("budget_range"):
-        merged["budget_range"] = rule_slots.get("budget_range")
 
     # Backfill direction when user wording is implicit (e.g. "全頭染粉色頭髮")
     # but downstream dye/perm/treatment slots are already clear.
@@ -1366,6 +1372,7 @@ def _extract_task_slots_cached(normalized_text):
         if inferred_direction:
             merged["direction"] = inferred_direction
 
+    _bridge_cross_domain_preference_for_perm(merged, rule_slots, normalized_text)
     _clear_cross_direction_slots(merged)
 
     # Let uncertain answers only fill the currently required slot.
@@ -1388,6 +1395,45 @@ def _extract_task_slots_cached(normalized_text):
         merged_slots=merged,
     )
     return merged
+
+
+def _bridge_cross_domain_preference_for_perm(merged_slots, rule_slots, normalized_text):
+    direction = (merged_slots or {}).get("direction")
+    if direction != "燙髮":
+        return
+    if (merged_slots or {}).get("perm_preference"):
+        return
+
+    explicit_perm = (rule_slots or {}).get("perm_preference")
+    if explicit_perm in TASK_SLOT_ENUMS.get("perm_preference", ()):
+        merged_slots["perm_preference"] = explicit_perm
+        return
+
+    if _has_any_phrase(
+        normalized_text,
+        (
+            "重視髮質修護",
+            "我在意髮質",
+            "髮質很重要",
+            "重視修護",
+            "修護優先",
+            "重視燙後髮質",
+        ),
+    ):
+        merged_slots["perm_preference"] = "重視燙後髮質、柔順度與修護感"
+        return
+
+    if _has_any_phrase(
+        normalized_text,
+        (
+            "平衡預算",
+            "預算優先",
+            "價格優先",
+            "cp值",
+            "cp 值",
+        ),
+    ):
+        merged_slots["perm_preference"] = "平衡預算，完成基本燙髮造型"
 
 
 def _extract_task_slots_with_llm(normalized_text):
@@ -1631,6 +1677,25 @@ def _budget_constraint_from_budget_range(budget_range, normalized_text):
     if not parsed:
         return None
     return {"min": parsed.get("min"), "max": parsed.get("max")}
+
+
+def _has_user_slot_evidence(slot_key, value, normalized_text):
+    if not value:
+        return False
+
+    if slot_key == "bleach_accept":
+        # Must be explicit user stance; question intent is not acceptance.
+        return _infer_bleach_accept_from_text(normalized_text) == value
+
+    if slot_key == "budget_range":
+        return _detect_budget_range(normalized_text) == value
+
+    if slot_key == "current_base":
+        inferred = _infer_current_base_candidate_from_text(normalized_text)
+        if inferred == value:
+            return True
+
+    return _slot_value_supported_by_user_text(slot_key, value, normalized_text)
 
 
 def _slot_value_supported_by_user_text(slot_key, value, normalized_text):
