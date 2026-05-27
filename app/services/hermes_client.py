@@ -1089,6 +1089,151 @@ def _consume_latest_message_for_task_fsm(state, normalized_message):
     state["slots"] = slots
     _debug_log("task_fsm_current_slot_parsed", current_slot=current_slot, value=value)
 
+    # Step 7: allow one user sentence to fill later consecutive slots only
+    # when the later values are explicitly present in that same message.
+    # This fixes cases such as "我想要整頭染成金色":
+    # dye_detail=全頭染, then target_color=高明度特殊色.
+    _consume_safe_consecutive_task_slots(
+        state,
+        normalized_message,
+        just_filled_slot=current_slot,
+    )
+
+
+
+def _consume_safe_consecutive_task_slots(state, normalized_message, just_filled_slot=None):
+    """Fill explicit later slots from the same user message.
+
+    Step 7 keeps the Step 4 safety rule: no global extraction and no guessing.
+    It only moves forward through the official FSM order, and only when the
+    same latest message explicitly contains the next slot's value.
+
+    Example:
+    current_slot=dye_detail, message="我想要整頭染成金色"
+    -> fill dye_detail=全頭染
+    -> safely continue to target_color=高明度特殊色
+    -> stop before current_base because no base is explicitly present.
+
+    It must not infer budget, brand priority, or bleach acceptance from a
+    message unless those values are explicitly stated.
+    """
+    slots = state.get("slots") or {}
+    text = _normalize_task_free_text(normalized_message)
+
+    # Do not auto-continue when the user is asking for clarification/advice.
+    if _is_followup_question(text) or _is_advice_or_choice_question(text):
+        state["slots"] = slots
+        return
+
+    # A short contextual answer like "前者" or "可以" belongs only to the active
+    # question. It should not be reused to fill following slots.
+    if _is_short_contextual_reply(text):
+        state["slots"] = slots
+        return
+
+    max_steps = 4
+    for _ in range(max_steps):
+        context_text = _slots_to_normalized_text(slots)
+        next_slot = _next_required_slot_for_slots(slots, context_text)
+        if next_slot == "budget_adjustment":
+            next_slot = "tradeoff_priority"
+        if not next_slot or next_slot == "recommend":
+            break
+        if next_slot == just_filled_slot:
+            break
+
+        value = _extract_explicit_value_for_consecutive_slot(next_slot, text, slots)
+        if value is None:
+            break
+
+        slots[next_slot] = value
+        if next_slot == "direction":
+            _clear_cross_direction_slots(slots)
+
+        _debug_log(
+            "task_fsm_safe_consecutive_slot_parsed",
+            current_slot=next_slot,
+            value=value,
+        )
+
+    state["slots"] = slots
+
+
+def _is_short_contextual_reply(text):
+    compact = re.sub(r"\s+", "", _normalize_task_free_text(text).lower())
+    if not compact:
+        return False
+    short_tokens = {
+        "前者", "後者", "第一個", "第二個", "第三個", "第四個",
+        "第1個", "第2個", "第3個", "第4個",
+        "1", "2", "3", "4", "一", "二", "三", "四",
+        "可以", "可", "好", "ok", "okay", "不行", "不要", "不想",
+        "是", "是的", "對", "對的", "沒錯", "不對", "不是",
+    }
+    return compact in short_tokens
+
+
+def _extract_explicit_value_for_consecutive_slot(slot_key, normalized_message, current_slots):
+    """Extract only explicit values for Step 7 consecutive parsing.
+
+    This intentionally avoids broad preference inference. For example,
+    "我的頭髮很毛躁，你會建議我用哪個" should not auto-fill brand_priority
+    here because Step 6 handles it with explanation + confirmation.
+    """
+    text = _normalize_task_free_text(normalized_message)
+
+    if slot_key == "direction":
+        return _detect_direction(text)
+
+    if slot_key == "dye_detail":
+        candidates = TASK_SLOT_KEYWORDS.get("dye_detail")
+        return _detect_slot_value(text, candidates) if candidates else None
+
+    if slot_key == "target_color":
+        candidates = TASK_SLOT_KEYWORDS.get("target_color")
+        return _detect_slot_value(text, candidates) if candidates else None
+
+    if slot_key == "current_base":
+        candidates = TASK_SLOT_KEYWORDS.get("current_base")
+        return _detect_slot_value(text, candidates) if candidates else None
+
+    if slot_key == "bleach_accept":
+        # Only accept explicit bleach wording in a longer multi-slot message.
+        if _has_any_phrase(text, ("不想漂", "不想要漂", "不要漂", "不漂", "不能漂", "不可以漂", "不接受漂", "希望不漂")):
+            return "希望不漂髮"
+        if _has_any_phrase(text, ("可以漂", "可漂", "接受漂", "能漂", "願意漂", "可以接受漂", "接受漂髮")):
+            return "可接受漂髮"
+        return None
+
+    if slot_key == "brand_priority":
+        if _has_any_phrase(text, ("重視染後髮質修護", "髮質修護優先", "髮質優先", "修護優先", "重視修護")):
+            return "重視染後髮質修護"
+        if _has_any_phrase(text, ("重視顏色表現與cp值", "重視顏色表現", "顏色表現優先", "cp值優先", "顯色優先")):
+            return "重視顏色表現與CP值"
+        if _has_any_phrase(text, ("兩者都重視", "兩個都重視", "兩個都想要", "都重要")):
+            return "兩者都重視"
+        return None
+
+    if slot_key == "budget_range":
+        return _detect_budget_range(text)
+
+    if slot_key == "tradeoff_priority":
+        if _has_any_phrase(text, ("以預算為優先", "預算優先", "價格優先", "便宜優先")):
+            return "以預算為優先"
+        if _has_any_phrase(text, ("以效果為優先", "效果優先", "顯色優先", "修護優先")):
+            return "以效果為優先"
+        if _is_uncertain_reply_text(text):
+            return "我不確定"
+        return None
+
+    if slot_key in {"perm_detail", "perm_blocker", "perm_preference", "treatment_detail"}:
+        candidates = TASK_SLOT_KEYWORDS.get(slot_key)
+        value = _detect_slot_value(text, candidates) if candidates else None
+        if slot_key == "perm_blocker" and not value and _has_any_phrase(text, ("以上皆無", "都沒有", "沒有", "無")):
+            return "以上皆無"
+        return value
+
+    return None
 
 def _apply_pending_confirmation_response(state, normalized_message):
     pending = state.get("pending_confirmation")
@@ -1547,6 +1692,8 @@ def _is_task_free_text_ready_from_slots(slots):
             return False
         if _needs_bleach_for_slots(slots) and not slots.get("bleach_accept"):
             return False
+        if _is_bleach_design_direct_ready(slots):
+            return True
         if not slots.get("brand_priority"):
             return False
         candidates = _candidate_services_for_task_slots(slots)
@@ -1728,7 +1875,34 @@ def _is_followup_question(text):
     normalized = _normalize_task_free_text(text)
     return _has_any_phrase(
         normalized,
-        ("?", "？", "為什麼", "怎麼", "需要", "要不要", "可以嗎", "會不會", "風險", "差別", "差在哪", "什麼意思", "甚麼意思", "建議", "推薦", "選哪個", "選哪一個", "哪個比較適合", "哪個適合", "該選哪個"),
+        (
+            "?",
+            "？",
+            "嗎",
+            "為什麼",
+            "怎麼",
+            "需要",
+            "要不要",
+            "可以嗎",
+            "會不會",
+            "一定要漂",
+            "要漂髮嗎",
+            "需要漂髮嗎",
+            "漂髮嗎",
+            "風險",
+            "差別",
+            "差在哪",
+            "什麼意思",
+            "甚麼意思",
+            "建議",
+            "推薦",
+            "選哪個",
+            "選哪一個",
+            "選哪種",
+            "哪個比較適合",
+            "哪個適合",
+            "該選哪個",
+        ),
     )
 
 
@@ -1755,7 +1929,7 @@ def _task_followup_explanation(conversation_text, user_message, slots=None):
     if _has_any_phrase(message, ("差別", "差在哪", "不同", "比較")):
         return _difference_explanation_for_next_slot(conversation_text, slots=slots)
 
-    if _has_any_phrase(message, ("需要漂", "要不要漂", "漂髮嗎", "會不會漂", "能不能不漂")):
+    if _has_any_phrase(message, ("需要漂", "要不要漂", "漂髮嗎", "要漂髮嗎", "一定要漂", "一定需要漂", "會不會漂", "能不能不漂")):
         target = slots.get("target_color")
         current = slots.get("current_base")
         color_hint = _extract_target_color_hint(text) or "目標色"
@@ -1816,6 +1990,52 @@ def _difference_explanation_for_next_slot(conversation_text, slots=None):
     return ""
 
 
+
+def _uncertain_explanation_for_current_slot(conversation_text, slots=None):
+    """Explain the active task-led choice when the user says they are unsure.
+
+    This prevents the controller from simply repeating the same question after
+    "我不確定", while still keeping the FSM state unchanged.
+    """
+    text = _normalize_task_free_text(conversation_text)
+    slots = dict(slots or _empty_task_slots())
+    direction = slots.get("direction")
+    required_slot = _next_required_slot_for_slots(slots, text)
+    if required_slot == "budget_adjustment":
+        required_slot = "tradeoff_priority"
+
+    if direction == "染髮":
+        if required_slot == "dye_detail":
+            return "全頭染是整頭換色，適合想明顯改變整體髮色；補染主要是處理新生髮根或局部色差，適合原本已有髮色、只想把髮根補齊。"
+        if required_slot == "target_color":
+            return "自然深色偏低調、通常較好維護；一般棕色是日常改變髮色；高明度特殊色像金色、粉色、灰色，通常需要更多前置處理。"
+        if required_slot == "current_base":
+            return "目前底色會影響染後能不能顯色。自然黑髮通常最難直接變亮；已染深色會受原本染劑影響；已染淺色或漂過通常比較容易做出明亮色。"
+        if required_slot == "bleach_accept":
+            return "如果目標是金色、灰色、粉色這類高明度色，接受漂髮通常能更接近目標；不漂髮則會走比較保守、較暗的顏色方向。"
+        if required_slot == "brand_priority":
+            return "重視染後髮質修護，會偏向降低染後乾澀與毛躁；重視顏色表現與CP值，會偏向顯色效率與預算平衡。"
+
+    if direction == "燙髮":
+        if required_slot == "perm_detail":
+            return "整體燙髮是改變整體捲度；髮根燙主要改善頭頂扁塌；燙瀏海是局部調整瀏海線條。"
+        if required_slot == "perm_blocker":
+            return "這題是安全限制檢查。漂過、懷孕或髮質嚴重受損都可能不適合直接燙髮。"
+        if required_slot == "perm_preference":
+            return "平衡預算偏向先完成基本燙髮造型；重視燙後髮質與修護感，會偏向較在意燙後柔順度與髮況負擔。"
+
+    if direction == "護髮":
+        if required_slot == "treatment_detail":
+            return "受損修護偏向染燙後乾裂與分岔；柔順抗毛躁偏向改善打結、毛躁與觸感；日常保養偏向一般維持光澤。"
+
+    if required_slot == "budget_range":
+        return "預算會影響可推薦的服務範圍。若沒有明確上限，也可以回答不確定，我會先用可行性與效果來收斂。"
+    if required_slot == "tradeoff_priority":
+        return "預算優先會傾向保守、可負擔的方案；效果優先會傾向更接近目標，但可能需要提高預算或接受更多處理。"
+    return ""
+
+
+
 def _guard_task_reply_if_not_ready(reply, ready, input_mode, history, message):
     content = _sanitize_template_reply(reply)
     if ready:
@@ -1824,7 +2044,19 @@ def _guard_task_reply_if_not_ready(reply, ready, input_mode, history, message):
     if input_mode == "text":
         conversation_text = _conversation_text(history, message)
         slots = _task_free_text_slots_from_history(history, message)
+        previous_slots = _task_free_text_slots_from_history(history, "")
         next_question = _next_task_free_text_question(conversation_text, message, slots=slots)
+
+        # If the user says "我不確定 / 不知道 / 不確定要選哪種" and this turn
+        # did not fill the current slot, do not repeat the exact same question.
+        # Explain the current decision axis, then ask the same slot again.
+        if _is_uncertain_reply_text(_normalize_task_free_text(message)) and not _task_slots_progressed(previous_slots, slots):
+            explanation = _uncertain_explanation_for_current_slot(conversation_text, slots=slots)
+            if explanation:
+                if next_question and next_question not in explanation:
+                    return f"{explanation}\n\n{next_question}"
+                return explanation
+
         if _is_followup_question(message):
             explanation = _task_followup_explanation(conversation_text, message, slots=slots)
             ai_reply = content.strip()
@@ -1909,6 +2141,8 @@ def _next_task_free_text_question(conversation_text, latest_user_message="", slo
                 return "你目前的髮色底色是自然黑髮、已染深色/中深色，還是已染淺色/已漂過？"
         if _needs_bleach_for_slots(flow_slots) and not flow_slots.get("bleach_accept"):
             return "若達到目標色可能需要漂髮，你可以接受嗎？"
+        if _is_bleach_design_direct_ready(flow_slots):
+            return "收到，我會根據你的條件整理最適合的服務方案。"
         if not flow_slots.get("brand_priority"):
             return "你這次更重視染後髮質修護，還是顏色表現與CP值？"
         candidates = _candidate_services_for_task_slots(flow_slots)
@@ -2009,6 +2243,8 @@ def _next_required_slot_for_slots(slots, normalized_text):
             return "current_base"
         if _needs_bleach_for_slots(flow_slots) and not (flow_slots or {}).get("bleach_accept"):
             return "bleach_accept"
+        if _is_bleach_design_direct_ready(flow_slots):
+            return None
         if not (flow_slots or {}).get("brand_priority"):
             return "brand_priority"
         candidates = _candidate_services_for_task_slots(flow_slots)
@@ -2060,8 +2296,35 @@ def _next_required_slot_for_slots(slots, normalized_text):
 def _is_uncertain_reply_text(normalized_text):
     return _has_any_phrase(
         normalized_text,
-        ("都可以", "我不確定", "不確定", "看你建議", "都行", "隨便", "沒差", "都想要"),
+        (
+            "都可以",
+            "我不確定",
+            "不確定",
+            "不知道",
+            "不清楚",
+            "不確定要選哪個",
+            "不確定要選哪種",
+            "不知道要選哪個",
+            "不知道要選哪種",
+            "看你建議",
+            "都行",
+            "隨便",
+            "沒差",
+            "都想要",
+        ),
     )
+
+
+def _task_slots_progressed(previous_slots, current_slots):
+    if not isinstance(previous_slots, dict) or not isinstance(current_slots, dict):
+        return False
+    for key in TASK_SLOT_ENUMS:
+        if previous_slots.get(key) != current_slots.get(key):
+            return True
+    if previous_slots.get("budget_range") != current_slots.get("budget_range"):
+        return True
+    return False
+
 
 
 def _clear_cross_direction_slots(slots):
@@ -2773,6 +3036,24 @@ def _normalized_dye_detail(detail):
         return "全頭染"
     return detail
 
+
+
+def _is_bleach_design_direct_ready(slots):
+    """Return True when bleach acceptance already determines the dye service.
+
+    For high-brightness/special-color full-head dye, accepting bleach directly
+    maps to the bleach design dye path, so the task-led flow should not ask
+    brand_priority/budget questions that only distinguish non-bleach dye options.
+    """
+    if not isinstance(slots, dict):
+        return False
+    return (
+        slots.get("direction") == "染髮"
+        and _normalized_dye_detail(slots.get("dye_detail")) == "全頭染"
+        and slots.get("target_color") == "高明度特殊色"
+        and slots.get("bleach_accept") == "可接受漂髮"
+        and _needs_bleach_for_slots(slots)
+    )
 
 def _needs_bleach_for_slots(slots):
     target = slots.get("target_color")
