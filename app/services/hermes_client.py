@@ -172,6 +172,65 @@ TASK_SLOT_ENUMS = {
 PERM_HARD_BLOCKERS = {"曾經漂過頭髮", "目前懷孕", "髮質嚴重受損或容易斷裂"}
 
 
+# Step 11: semantic slot schemas.
+# These schemas are used only as a bounded fallback for the current FSM slot.
+# They do not decide flow, fill other slots, or recommend services.
+SEMANTIC_SLOT_SCHEMAS = {
+    "dye_detail": {
+        "allowed_values": TASK_SLOT_ENUMS["dye_detail"],
+        "slot_description": "判斷使用者這次染髮需求是全頭染、補染，或需要漂髮/設計染。",
+        "examples": {
+            "全頭染": ("整顆頭都要換色", "想整體換一個髮色", "全部重新染", "不是只補髮根"),
+            "補染": ("只補新長出來的髮根", "布丁頭想處理", "只補頭頂長出來的地方", "只補根部"),
+            "漂髮設計染": ("想做耳圈染", "想挑染", "想做特殊色設計", "需要漂的造型染"),
+        },
+        "reject_rule": "若訊息只是在問價格、品牌、髮質、預算或顏色深淺，不可分類為 dye_detail。",
+    },
+    "target_color": {
+        "allowed_values": TASK_SLOT_ENUMS["target_color"],
+        "slot_description": "判斷使用者想要的目標髮色屬於自然深色、一般棕色，或高明度特殊色。",
+        "examples": {
+            "自然深色": ("自然黑茶", "深咖啡", "低調一點", "看起來像沒染但有質感", "黑茶色"),
+            "一般棕色": ("可可色", "巧克力色", "奶茶咖", "霧棕", "茶棕", "焦糖棕"),
+            "高明度特殊色": ("米金色", "淺亞麻", "灰霧色", "粉棕偏粉", "藍黑偏藍", "紫灰", "銀灰"),
+        },
+        "reject_rule": "若訊息描述的是目前底色而非想染成的顏色，不可分類為 target_color。",
+    },
+    "current_base": {
+        "allowed_values": TASK_SLOT_ENUMS["current_base"],
+        "slot_description": "判斷使用者目前髮色/底色是自然黑髮、已染深色/中深色，或已染淺色/已漂過。",
+        "examples": {
+            "自然黑髮": ("沒有染過", "原本髮色", "自然黑", "沒漂也沒染"),
+            "已染深色/中深色": ("之前染過咖啡", "現在偏深棕", "有染過深色", "目前是暗色系"),
+            "已染淺色/已漂過": ("之前漂過", "現在很淺", "退成金色", "漂過一次", "目前髮尾很亮"),
+        },
+        "reject_rule": "若訊息描述的是想染成的目標顏色而非目前底色，不可分類為 current_base。",
+    },
+    "bleach_accept": {
+        "allowed_values": TASK_SLOT_ENUMS["bleach_accept"],
+        "slot_description": "判斷使用者是否接受漂髮。",
+        "examples": {
+            "可接受漂髮": ("可以為了顏色漂", "願意漂一次", "需要的話可以漂", "能接受漂髮"),
+            "希望不漂髮": ("不想傷頭髮所以不要漂", "盡量不要漂", "不能漂", "不希望漂", "不要漂比較好"),
+        },
+        "reject_rule": "若訊息只是在描述曾經漂過或目前底色，不可分類為 bleach_accept。",
+    },
+    "brand_priority": {
+        "allowed_values": TASK_SLOT_ENUMS["brand_priority"],
+        "slot_description": "判斷使用者選染髮方案時更重視染後髮質修護、顏色表現/CP值，或兩者都重視。",
+        "examples": {
+            "重視染後髮質修護": ("希望染完不要太乾", "怕髮質變差", "比較在意護髮感", "頭髮已經受損想保守"),
+            "重視顏色表現與CP值": ("想顏色明顯一點", "希望划算", "預算有限但想有效果", "比較在意顯色"),
+            "兩者都重視": ("髮質和顏色都想顧", "兩個都在意", "希望不要太傷也要好看", "都重要"),
+        },
+        "reject_rule": "若訊息只是在回答顏色、底色、是否漂髮或預算數字，不可分類為 brand_priority。",
+    },
+}
+
+SEMANTIC_SLOT_KEYS = set(SEMANTIC_SLOT_SCHEMAS.keys())
+
+
+
 def _service_price_bounds():
     bounds = {}
     for category in SERVICE_CATEGORIES:
@@ -1235,6 +1294,169 @@ def _extract_explicit_value_for_consecutive_slot(slot_key, normalized_message, c
 
     return None
 
+
+def _semantic_parse_current_slot(slot_key, user_message, current_slots):
+    """Bounded semantic fallback for the current FSM slot.
+
+    Step 10 + Step 12:
+    - Input is limited to the current slot, latest user message, and current slots.
+    - Output is only one enum value from the slot schema plus confidence.
+    - It never advances flow, fills other slots, or recommends a service.
+    """
+    del current_slots
+    if slot_key not in SEMANTIC_SLOT_SCHEMAS:
+        return _semantic_none("slot_not_supported")
+
+    text = _normalize_task_free_text(user_message)
+    if not text:
+        return _semantic_none("empty_message")
+
+    if _semantic_rejects_slot(slot_key, text):
+        return _semantic_none("rejected_by_slot_rule")
+
+    candidates = _semantic_candidates_for_slot(slot_key, text)
+    if not candidates:
+        return _semantic_none("no_semantic_match")
+
+    candidates.sort(key=lambda item: item["score"], reverse=True)
+    best = candidates[0]
+    if len(candidates) > 1 and candidates[1]["score"] == best["score"]:
+        return _semantic_none("ambiguous_semantic_match")
+
+    allowed_values = SEMANTIC_SLOT_SCHEMAS[slot_key]["allowed_values"]
+    if best["value"] not in allowed_values:
+        return _semantic_none("value_not_allowed")
+
+    confidence = "high" if best["score"] >= 3 else "medium"
+    return {
+        "value": best["value"],
+        "confidence": confidence,
+        "reason": best["reason"],
+    }
+
+
+def _semantic_none(reason=""):
+    return {"value": None, "confidence": "none", "reason": reason}
+
+
+def _semantic_rejects_slot(slot_key, text):
+    """Reject messages that clearly belong to another slot.
+
+    This prevents the semantic fallback from turning any vague answer into a
+    slot value after the deterministic keyword parser fails.
+    """
+    compact = re.sub(r"\s+", "", _normalize_task_free_text(text).lower())
+
+    if slot_key == "dye_detail":
+        return bool(_detect_budget_range(text)) or _has_any_phrase(
+            text,
+            ("預算", "價位", "多少錢", "修護", "髮質", "品牌", "資生堂", "哥德式")
+        )
+
+    if slot_key == "target_color":
+        return _has_any_phrase(text, ("目前", "現在", "原本", "底色", "退成", "之前", "染過", "漂過"))
+
+    if slot_key == "current_base":
+        return _has_any_phrase(text, ("想染", "想要染", "染成", "希望染", "目標", "想變成", "我要染"))
+
+    if slot_key == "bleach_accept":
+        # "漂過" is current_base / perm_blocker evidence, not acceptance.
+        if _has_any_phrase(text, ("漂過", "曾經漂", "之前漂", "已經漂")):
+            return True
+        return bool(_detect_budget_range(text))
+
+    if slot_key == "brand_priority":
+        if bool(_detect_budget_range(text)):
+            return True
+        color_only = _semantic_color_only_text(compact)
+        if color_only:
+            return True
+
+    return False
+
+
+def _semantic_color_only_text(compact_text):
+    if not compact_text:
+        return False
+    color_tokens = (
+        "黑", "黑茶", "深咖", "咖啡", "棕", "可可", "巧克力", "奶茶",
+        "金", "亞麻", "灰", "銀", "粉", "藍", "紫", "橘", "紅"
+    )
+    intent_tokens = ("髮質", "修護", "護髮", "顯色", "cp", "價格", "預算", "划算", "效果", "都")
+    return any(token in compact_text for token in color_tokens) and not any(token in compact_text for token in intent_tokens)
+
+
+def _semantic_candidates_for_slot(slot_key, text):
+    if slot_key == "dye_detail":
+        return _semantic_dye_detail_candidates(text)
+    if slot_key == "target_color":
+        return _semantic_target_color_candidates(text)
+    if slot_key == "current_base":
+        return _semantic_current_base_candidates(text)
+    if slot_key == "bleach_accept":
+        return _semantic_bleach_accept_candidates(text)
+    if slot_key == "brand_priority":
+        return _semantic_brand_priority_candidates(text)
+    return []
+
+
+def _semantic_candidate(value, score, reason):
+    return {"value": value, "score": score, "reason": reason}
+
+
+def _semantic_dye_detail_candidates(text):
+    candidates = []
+    if _has_any_phrase(text, ("整顆頭", "整個頭", "全部頭髮", "全部都染", "全部重新染", "整體換色", "不是補髮根", "不是只補")):
+        candidates.append(_semantic_candidate("全頭染", 3, "語意表示整體換色，不是只處理髮根。"))
+    if _has_any_phrase(text, ("新長出來", "長出來的地方", "根部", "只補根", "只補髮根", "頭頂長出來", "布丁")):
+        candidates.append(_semantic_candidate("補染", 3, "語意表示只處理新生髮或髮根區域。"))
+    if _has_any_phrase(text, ("耳圈", "挑染", "線條染", "區塊染", "特殊設計", "設計染", "局部漂", "局部特殊色")):
+        candidates.append(_semantic_candidate("漂髮設計染", 3, "語意表示需要設計染、局部漂或特殊色效果。"))
+    return candidates
+
+
+def _semantic_target_color_candidates(text):
+    candidates = []
+    if _has_any_phrase(text, ("黑茶", "自然茶", "低調", "看不太出來有染", "像沒染", "自然一點", "深咖啡", "深棕黑")):
+        candidates.append(_semantic_candidate("自然深色", 3, "語意接近自然、低調或深色系目標髮色。"))
+    if _has_any_phrase(text, ("可可", "巧克力", "焦糖", "霧棕", "茶棕", "奶茶咖", "咖色", "咖啡色系", "棕色系")):
+        candidates.append(_semantic_candidate("一般棕色", 3, "語意接近棕色、咖啡色或奶茶棕色系。"))
+    if _has_any_phrase(text, ("米金", "淺亞麻", "亞麻", "銀灰", "灰霧", "霧灰", "紫灰", "藍灰", "粉棕", "玫瑰", "很淺", "亮一點", "特殊一點")):
+        candidates.append(_semantic_candidate("高明度特殊色", 3, "語意接近高明度、灰感、粉紫藍或特殊色。"))
+    return candidates
+
+
+def _semantic_current_base_candidates(text):
+    candidates = []
+    if _has_any_phrase(text, ("沒染過", "沒有染過", "原本髮色", "原生髮", "自然黑", "沒漂沒染", "從來沒染")):
+        candidates.append(_semantic_candidate("自然黑髮", 3, "語意表示目前是未染未漂的自然髮色。"))
+    if _has_any_phrase(text, ("之前染咖啡", "染過咖啡", "目前偏深", "現在偏深", "深棕", "暗棕", "深咖", "暗色系", "黑棕")):
+        candidates.append(_semantic_candidate("已染深色/中深色", 3, "語意表示目前已有中深色或深色染髮底。"))
+    if _has_any_phrase(text, ("退成金", "退色很淺", "現在很淺", "髮尾很亮", "之前有漂", "漂過一次", "漂過兩次", "淺底", "金底")):
+        candidates.append(_semantic_candidate("已染淺色/已漂過", 3, "語意表示目前是淺色底或曾經漂過。"))
+    return candidates
+
+
+def _semantic_bleach_accept_candidates(text):
+    candidates = []
+    if _has_any_phrase(text, ("需要的話可以", "為了顏色可以", "可以為了效果", "願意漂", "能接受漂", "可以漂一次", "可以小漂")):
+        candidates.append(_semantic_candidate("可接受漂髮", 3, "語意表示若效果需要，使用者可以接受漂髮。"))
+    if _has_any_phrase(text, ("盡量不要漂", "最好不要漂", "不要傷頭髮", "怕漂壞", "不希望漂", "不考慮漂", "不想傷髮質", "不要漂比較好")):
+        candidates.append(_semantic_candidate("希望不漂髮", 3, "語意表示使用者傾向避免漂髮。"))
+    return candidates
+
+
+def _semantic_brand_priority_candidates(text):
+    candidates = []
+    if _has_any_phrase(text, ("染完不要太乾", "不要太傷", "怕傷髮質", "髮質不要變差", "想保護髮質", "護髮感", "頭髮已經受損", "希望柔順")):
+        candidates.append(_semantic_candidate("重視染後髮質修護", 3, "語意表示使用者優先在意染後髮質與修護感。"))
+    if _has_any_phrase(text, ("顏色明顯", "想要顯色", "顯色度", "看得出來有染", "划算", "cp高", "cp 高", "不要太貴", "預算有限", "便宜一點")):
+        candidates.append(_semantic_candidate("重視顏色表現與CP值", 3, "語意表示使用者優先在意顯色、效果或預算表現。"))
+    if _has_any_phrase(text, ("都想顧", "都在意", "都重要", "不要太傷也要好看", "顏色和髮質都", "髮質和顏色都", "兩個都")):
+        candidates.append(_semantic_candidate("兩者都重視", 3, "語意表示使用者同時重視髮質與顏色/CP值。"))
+    return candidates
+
+
 def _apply_pending_confirmation_response(state, normalized_message):
     pending = state.get("pending_confirmation")
     if not pending:
@@ -1664,6 +1886,18 @@ def _extract_value_for_current_task_slot(slot_key, normalized_message, current_s
         value = _detect_slot_value(normalized_message, candidates)
         if value:
             return value
+
+    # Step 12: deterministic keyword parser first; bounded semantic parser second.
+    # Semantic fallback is restricted to the current slot and only commits high-confidence values.
+    semantic_result = _semantic_parse_current_slot(slot_key, normalized_message, current_slots)
+    if semantic_result.get("confidence") == "high" and semantic_result.get("value"):
+        _debug_log(
+            "task_fsm_semantic_slot_parsed",
+            current_slot=slot_key,
+            value=semantic_result.get("value"),
+            reason=semantic_result.get("reason"),
+        )
+        return semantic_result.get("value")
 
     if slot_key == "perm_blocker" and _has_any_phrase(normalized_message, ("沒有", "都沒有", "無", "以上皆無")):
         return "以上皆無"
