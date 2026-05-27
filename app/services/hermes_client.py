@@ -98,13 +98,13 @@ TASK_SLOT_KEYWORDS = {
         "已染淺色/已漂過": ("已染淺色", "已漂過", "漂過", "淺色底", "金色底"),
     },
     "bleach_accept": {
-        "可接受漂髮": ("可接受漂髮", "可以漂", "可漂", "接受漂", "能漂", "可以", "可以啊", "好", "ok", "沒問題"),
+        "可接受漂髮": ("可接受漂髮", "可以漂", "可漂", "接受漂", "能漂", "可以接受漂髮"),
         "希望不漂髮": ("希望不漂髮", "不想漂", "不要漂", "不漂", "不行", "不可以"),
     },
     "brand_priority": {
         "重視染後髮質修護": ("重視染後髮質修護", "髮質修護", "比較護髮", "髮質優先"),
         "重視顏色表現與CP值": ("重視顏色表現與CP值", "顏色表現", "cp值", "價格優先", "預算優先"),
-        "兩者都重視": ("兩者都重視", "都想要", "兩個都想要", "都重要", "都可以", "看你建議"),
+        "兩者都重視": ("兩者都重視", "都想要", "兩個都想要", "都重要"),
     },
     "tradeoff_priority": {
         "以預算為優先": ("以預算為優先", "以價位為優先", "價位優先", "預算優先", "以預算為主", "以價格為主"),
@@ -112,8 +112,8 @@ TASK_SLOT_KEYWORDS = {
         "我不確定": ("我不確定", "不確定"),
     },
     "perm_detail": {
-        "整體燙髮": ("整體燙髮", "全頭燙", "燙全頭", "燙捲"),
-        "髮根燙": ("髮根燙", "髮根蓬鬆", "頭頂扁塌"),
+        "整體燙髮": ("整體燙髮", "全頭燙", "燙全頭", "燙捲", "整頭燙"),
+        "髮根燙": ("髮根燙", "燙髮根", "髮根蓬鬆", "頭頂扁塌"),
         "燙瀏海": ("燙瀏海", "瀏海燙"),
     },
     "perm_blocker": {
@@ -130,13 +130,15 @@ TASK_SLOT_KEYWORDS = {
             "修護感",
             "質感優先",
             "髮質優先",
+            "重視髮質",
             "重視髮質修護",
+            "在意髮質",
             "我在意髮質",
             "髮質很重要",
             "重視修護",
             "修護優先",
         ),
-        "不確定": ("不確定", "不確定，請用預算判斷", "都可以", "看你建議"),
+        "不確定": ("不確定", "不確定，請用預算判斷"),
     },
     "treatment_detail": {
         "受損修護": ("受損修護", "護髮修護", "深層修護", "染燙受損", "髮尾毛裂", "髮尾乾燥", "受損"),
@@ -715,7 +717,7 @@ def _force_final_at_turn_limit(model_response, input_mode, conversation_style, m
                 "final_output": final_output,
             }
 
-        if user_turn_count < 12:
+        if user_turn_count < 15:
             return model_response
 
         final_output = _build_task_text_final_output(conversation_text) or _build_default_final_output(conversation_text)
@@ -856,7 +858,8 @@ def _is_task_free_text_ready(conversation_text):
     if not text:
         return False
 
-    slots = _extract_task_slots(text)
+    raw_slots = _extract_task_slots(text)
+    slots = _slots_with_confirmed_values(raw_slots)
     direction = slots.get("direction")
     if direction is None:
         return False
@@ -875,8 +878,6 @@ def _is_task_free_text_ready(conversation_text):
         if _needs_bleach_for_slots(slots):
             if not slots.get("bleach_accept"):
                 return False
-            if slots.get("bleach_accept") == "可接受漂髮":
-                return True
         if not slots.get("brand_priority"):
             return False
         candidates = _candidate_services_for_task_slots(slots)
@@ -900,13 +901,13 @@ def _is_task_free_text_ready(conversation_text):
             return True
         if not slots.get("perm_preference"):
             return False
+        if not slots.get("budget_range"):
+            return False
         if slots.get("perm_preference") in {
             "平衡預算，完成基本燙髮造型",
             "重視燙後髮質、柔順度與修護感",
         }:
             return True
-        if not slots.get("budget_range"):
-            return False
         if _needs_tradeoff_priority(slots, text):
             return bool(slots.get("tradeoff_priority"))
         if _has_budget_compatible_candidates(slots, text):
@@ -998,6 +999,11 @@ def _task_followup_explanation(conversation_text, user_message):
     message = _normalize_task_free_text(user_message)
     slots = _extract_task_slots(text)
     direction = slots.get("direction")
+    if direction == "燙髮":
+        if _has_any_phrase(message, ("差別", "差在哪", "不同", "比較")):
+            if not _slot_value_for_flow(slots, "perm_detail"):
+                return "整體燙髮是改變整體捲度；髮根燙主要增加頭頂蓬鬆；燙瀏海則是局部修飾臉型。"
+        return ""
     if direction != "染髮":
         return ""
 
@@ -1123,145 +1129,180 @@ def _extract_target_color_hint(normalized_text):
 def _next_task_free_text_question(conversation_text, latest_user_message=""):
     text = _normalize_task_free_text(conversation_text)
     slots = _extract_task_slots(text)
-    direction = slots.get("direction")
+    flow_slots = _slots_with_confirmed_values(slots)
+    direction = flow_slots.get("direction")
+
+    required_slot = _next_required_slot_for_slots(slots, text)
+    if required_slot and required_slot in _pending_slots_set(slots):
+        confirmation = _pending_slot_confirmation_question(required_slot, slots)
+        if confirmation:
+            return confirmation
+
     if direction is None:
         return "你這次主要想做哪一類：染髮、燙髮，還是護髮？"
 
     if direction == "染髮":
-        if not slots.get("dye_detail"):
+        if not flow_slots.get("dye_detail"):
             return "你這次染髮比較接近全頭染，還是補染？"
-        detail = _normalized_dye_detail(slots.get("dye_detail"))
+        detail = _normalized_dye_detail(flow_slots.get("dye_detail"))
         if detail == "補染":
             return "收到，我會根據你的條件整理最適合的服務方案。"
         if detail != "全頭染":
             return "你這次染髮比較接近全頭染，還是補染？"
-        if not slots.get("target_color"):
+        if not flow_slots.get("target_color"):
             return "你想染後的顏色比較接近自然深色、一般棕色，還是高明度特殊色？"
-        if not slots.get("current_base"):
+        if not flow_slots.get("current_base"):
             candidate_base = _infer_current_base_candidate_from_text(text)
             if candidate_base and _is_affirmative_reply_text(latest_user_message):
-                slots["current_base"] = candidate_base
+                flow_slots["current_base"] = candidate_base
             elif candidate_base and not _is_negative_reply_text(latest_user_message):
                 return f"你目前底色比較像「{candidate_base}」，這樣對嗎？"
             else:
                 return "你目前的髮色底色是自然黑髮、已染深色/中深色，還是已染淺色/已漂過？"
-        if _needs_bleach_for_slots(slots) and not slots.get("bleach_accept"):
+        if _needs_bleach_for_slots(flow_slots) and not flow_slots.get("bleach_accept"):
             return "若達到目標色可能需要漂髮，你可以接受嗎？"
-        if _needs_bleach_for_slots(slots) and slots.get("bleach_accept") == "可接受漂髮":
-            return "收到，我會根據你的條件整理最適合的服務方案。"
-        if not slots.get("brand_priority"):
+        if not flow_slots.get("brand_priority"):
             return "你這次更重視染後髮質修護，還是顏色表現與CP值？"
-        candidates = _candidate_services_for_task_slots(slots)
+        candidates = _candidate_services_for_task_slots(flow_slots)
         if len(candidates) <= 1:
             return "收到，我會根據你的條件整理最適合的服務方案。"
-        if not slots.get("budget_range"):
+        if not flow_slots.get("budget_range"):
             return "你的預算價位區間大約在哪裡？例如 1200以下、1201-1800、1801-2400、2401以上。"
-        if _needs_tradeoff_priority(slots, text) and not slots.get("tradeoff_priority"):
+        if _needs_tradeoff_priority(flow_slots, text) and not flow_slots.get("tradeoff_priority"):
             return "看起來預算與效果偏好有取捨，你想優先哪一個：預算，還是效果？"
-        if not _has_budget_compatible_candidates(slots, text):
+        if not _has_budget_compatible_candidates(flow_slots, text):
             return "目前預算可能和條件不一致，你想提高預算，還是調整服務需求？"
         return "收到，我會根據你的條件整理最適合的服務方案。"
 
     if direction == "燙髮":
-        if not slots.get("perm_detail"):
+        if not flow_slots.get("perm_detail"):
             return "你想做整體燙髮、髮根燙，還是燙瀏海？"
-        if not slots.get("perm_blocker"):
+        if not flow_slots.get("perm_blocker"):
             return "是否有不可燙條件：曾經漂過頭髮、目前懷孕、髮質嚴重受損或容易斷裂、以上皆無？"
-        if slots.get("perm_blocker") in PERM_HARD_BLOCKERS:
+        if flow_slots.get("perm_blocker") in PERM_HARD_BLOCKERS:
             return "你的條件已命中不可操作限制，這次會先提供保守建議。"
-        if slots.get("perm_detail") in {"髮根燙", "燙瀏海"}:
+        if flow_slots.get("perm_detail") in {"髮根燙", "燙瀏海"}:
             return "收到，我會根據你的條件整理最適合的服務方案。"
-        if not slots.get("perm_preference"):
+        if not flow_slots.get("perm_preference"):
             return "若是整體燙髮，你偏向平衡預算完成基本造型，還是重視燙後髮質與修護感？"
-        if slots.get("perm_preference") == "不確定" and not slots.get("budget_range"):
+        if flow_slots.get("perm_preference") == "不確定" and not flow_slots.get("budget_range"):
             return "若你還不確定，預算大約落在哪一段？例如 1200以下、1201-1800、1801-2400、2401以上。"
-        if slots.get("perm_preference") != "不確定":
-            return "收到，我會根據你的條件整理最適合的服務方案。"
-        if not slots.get("budget_range"):
+        if not flow_slots.get("budget_range"):
             return "你的預算價位區間大約在哪裡？例如 1200以下、1201-1800、1801-2400、2401以上。"
-        if _needs_tradeoff_priority(slots, text) and not slots.get("tradeoff_priority"):
+        if flow_slots.get("perm_preference") != "不確定":
+            return "收到，我會根據你的條件整理最適合的服務方案。"
+        if _needs_tradeoff_priority(flow_slots, text) and not flow_slots.get("tradeoff_priority"):
             return "看起來預算與效果偏好有取捨，你想優先哪一個：預算，還是效果？"
-        if not _has_budget_compatible_candidates(slots, text):
+        if not _has_budget_compatible_candidates(flow_slots, text):
             return "目前預算可能和條件不一致，你想提高預算，還是調整服務需求？"
         return "收到，我會根據你的條件整理最適合的服務方案。"
 
     if direction == "護髮":
-        if not slots.get("treatment_detail"):
+        if not flow_slots.get("treatment_detail"):
             return "你這次最想改善哪種髮絲狀況：受損修護、柔順抗毛躁，還是日常保養？"
-        if not slots.get("budget_range"):
+        if not flow_slots.get("budget_range"):
             return "你的預算價位區間大約在哪裡？例如 1200以下、1201-1800。"
-        if _needs_tradeoff_priority(slots, text) and not slots.get("tradeoff_priority"):
+        if _needs_tradeoff_priority(flow_slots, text) and not flow_slots.get("tradeoff_priority"):
             return "看起來預算與效果偏好有取捨，你想優先哪一個：預算，還是效果？"
-        if not _has_budget_compatible_candidates(slots, text):
+        if not _has_budget_compatible_candidates(flow_slots, text):
             return "目前預算可能和條件不一致，你想提高預算，還是調整服務需求？"
         return "收到，我會根據你的條件整理最適合的服務方案。"
 
     return "我需要再確認一個條件，才能準確推薦。你目前最在意的是預算、時間，還是髮況限制？"
 
 
+def _pending_slot_confirmation_question(slot_key, slots):
+    value = (slots or {}).get(slot_key)
+    if not value:
+        return ""
+    if slot_key == "dye_detail":
+        if value == "全頭染":
+            return "我先理解成你這次是全頭染，這樣對嗎？"
+        if value == "補染":
+            return "我先理解成你這次是補染，這樣對嗎？"
+    if slot_key == "perm_detail":
+        if value == "整體燙髮":
+            return "我先理解成你這次是整體燙髮，這樣對嗎？"
+        if value == "髮根燙":
+            return "我先理解成你想做髮根燙，這樣對嗎？"
+        if value == "燙瀏海":
+            return "我先理解成你想做燙瀏海，這樣對嗎？"
+    if slot_key == "current_base":
+        return f"我先理解成你目前底色是「{value}」，這樣對嗎？"
+    if slot_key == "perm_preference":
+        if value == "重視燙後髮質、柔順度與修護感":
+            return "我先理解成你是重視燙後髮質與修護感，這樣對嗎？"
+        if value == "平衡預算，完成基本燙髮造型":
+            return "我先理解成你偏向先平衡預算完成基本造型，這樣對嗎？"
+    if slot_key == "brand_priority":
+        return f"我先理解成你這次偏好是「{value}」，這樣對嗎？"
+    if slot_key == "tradeoff_priority":
+        return f"我先理解成你想以「{value.replace('以', '').replace('為優先', '')}」為主，這樣對嗎？"
+    return ""
+
+
 def _next_required_slot_for_slots(slots, normalized_text):
-    direction = (slots or {}).get("direction")
+    flow_slots = _slots_with_confirmed_values(slots)
+    direction = (flow_slots or {}).get("direction")
     if not direction:
         return "direction"
 
     if direction == "染髮":
-        detail = _normalized_dye_detail((slots or {}).get("dye_detail"))
+        detail = _normalized_dye_detail((flow_slots or {}).get("dye_detail"))
         if not detail:
             return "dye_detail"
         if detail == "補染":
             return None
         if detail != "全頭染":
             return "dye_detail"
-        if not (slots or {}).get("target_color"):
+        if not (flow_slots or {}).get("target_color"):
             return "target_color"
-        if not (slots or {}).get("current_base"):
+        if not (flow_slots or {}).get("current_base"):
             return "current_base"
-        if _needs_bleach_for_slots(slots) and not (slots or {}).get("bleach_accept"):
+        if _needs_bleach_for_slots(flow_slots) and not (flow_slots or {}).get("bleach_accept"):
             return "bleach_accept"
-        if _needs_bleach_for_slots(slots) and (slots or {}).get("bleach_accept") == "可接受漂髮":
-            return None
-        if not (slots or {}).get("brand_priority"):
+        if not (flow_slots or {}).get("brand_priority"):
             return "brand_priority"
-        candidates = _candidate_services_for_task_slots(slots)
+        candidates = _candidate_services_for_task_slots(flow_slots)
         if len(candidates) <= 1:
             return None
-        if not (slots or {}).get("budget_range"):
+        if not (flow_slots or {}).get("budget_range"):
             return "budget_range"
-        if _needs_tradeoff_priority(slots, normalized_text) and not (slots or {}).get("tradeoff_priority"):
+        if _needs_tradeoff_priority(flow_slots, normalized_text) and not (flow_slots or {}).get("tradeoff_priority"):
             return "tradeoff_priority"
-        if not _has_budget_compatible_candidates(slots, normalized_text):
+        if not _has_budget_compatible_candidates(flow_slots, normalized_text):
             return "budget_adjustment"
         return None
 
     if direction == "燙髮":
-        if not (slots or {}).get("perm_detail"):
+        if not (flow_slots or {}).get("perm_detail"):
             return "perm_detail"
-        if not (slots or {}).get("perm_blocker"):
+        if not (flow_slots or {}).get("perm_blocker"):
             return "perm_blocker"
-        if (slots or {}).get("perm_blocker") in PERM_HARD_BLOCKERS:
+        if (flow_slots or {}).get("perm_blocker") in PERM_HARD_BLOCKERS:
             return None
-        if (slots or {}).get("perm_detail") in {"髮根燙", "燙瀏海"}:
+        if (flow_slots or {}).get("perm_detail") in {"髮根燙", "燙瀏海"}:
             return None
-        if not (slots or {}).get("perm_preference"):
+        if not (flow_slots or {}).get("perm_preference"):
             return "perm_preference"
-        if (slots or {}).get("perm_preference") != "不確定":
-            return None
-        if not (slots or {}).get("budget_range"):
+        if not (flow_slots or {}).get("budget_range"):
             return "budget_range"
-        if _needs_tradeoff_priority(slots, normalized_text) and not (slots or {}).get("tradeoff_priority"):
+        if (flow_slots or {}).get("perm_preference") != "不確定":
+            return None
+        if _needs_tradeoff_priority(flow_slots, normalized_text) and not (flow_slots or {}).get("tradeoff_priority"):
             return "tradeoff_priority"
-        if not _has_budget_compatible_candidates(slots, normalized_text):
+        if not _has_budget_compatible_candidates(flow_slots, normalized_text):
             return "budget_adjustment"
         return None
 
     if direction == "護髮":
-        if not (slots or {}).get("treatment_detail"):
+        if not (flow_slots or {}).get("treatment_detail"):
             return "treatment_detail"
-        if not (slots or {}).get("budget_range"):
+        if not (flow_slots or {}).get("budget_range"):
             return "budget_range"
-        if _needs_tradeoff_priority(slots, normalized_text) and not (slots or {}).get("tradeoff_priority"):
+        if _needs_tradeoff_priority(flow_slots, normalized_text) and not (flow_slots or {}).get("tradeoff_priority"):
             return "tradeoff_priority"
-        if not _has_budget_compatible_candidates(slots, normalized_text):
+        if not _has_budget_compatible_candidates(flow_slots, normalized_text):
             return "budget_adjustment"
         return None
 
@@ -1335,31 +1376,43 @@ def _extract_task_slots_cached(normalized_text):
         return rule_slots
 
     merged = dict(rule_slots)
+    pending_slots = set()
     llm_confidence = {}
     for slot_key in TASK_SLOT_ENUMS:
         llm_value = llm_slots.get(slot_key)
         if llm_value not in TASK_SLOT_ENUMS[slot_key]:
             continue
-        # Keep rule-extracted value first; only fill from LLM when user wording supports it.
+        # Keep rule-extracted value first; let LLM fill with evidence levels.
         if merged.get(slot_key):
             continue
-        if not _has_user_slot_evidence(slot_key, llm_value, normalized_text):
+        evidence_level = _slot_evidence_level(slot_key, llm_value, normalized_text)
+        if evidence_level == "none":
             continue
         if slot_key == "target_color":
             confidence = _llm_target_color_confidence(llm_value, normalized_text)
             llm_confidence[slot_key] = confidence
             merged[slot_key] = llm_value
+            if evidence_level == "derived" and _slot_requires_confirmation(slot_key):
+                pending_slots.add(slot_key)
             continue
         if slot_key == "current_base":
             confidence = _llm_current_base_confidence(llm_value, normalized_text)
             llm_confidence[slot_key] = confidence
             merged[slot_key] = llm_value
+            if evidence_level == "derived" and _slot_requires_confirmation(slot_key):
+                pending_slots.add(slot_key)
             continue
         merged[slot_key] = llm_value
+        if evidence_level == "derived" and _slot_requires_confirmation(slot_key):
+            pending_slots.add(slot_key)
 
     llm_budget = llm_slots.get("budget_range")
-    if not merged.get("budget_range") and llm_budget and _has_user_slot_evidence("budget_range", llm_budget, normalized_text):
-        merged["budget_range"] = llm_budget
+    if not merged.get("budget_range") and llm_budget:
+        budget_evidence = _slot_evidence_level("budget_range", llm_budget, normalized_text)
+        if budget_evidence != "none":
+            merged["budget_range"] = llm_budget
+            if budget_evidence == "derived" and _slot_requires_confirmation("budget_range"):
+                pending_slots.add("budget_range")
 
     # Backfill direction when user wording is implicit (e.g. "全頭染粉色頭髮")
     # but downstream dye/perm/treatment slots are already clear.
@@ -1376,14 +1429,24 @@ def _extract_task_slots_cached(normalized_text):
     _clear_cross_direction_slots(merged)
 
     # Let uncertain answers only fill the currently required slot.
-    required_slot = _next_required_slot_for_slots(merged, normalized_text)
+    pre_required_slot = _next_required_slot_for_slots(merged, normalized_text)
     if _is_uncertain_reply_text(normalized_text):
-        if required_slot == "budget_range" and not merged.get("budget_range"):
+        if pre_required_slot == "budget_range" and not merged.get("budget_range"):
             merged["budget_range"] = BUDGET_NO_PREFERENCE
-        elif required_slot == "tradeoff_priority" and not merged.get("tradeoff_priority"):
+            pending_slots.discard("budget_range")
+        elif pre_required_slot == "tradeoff_priority" and not merged.get("tradeoff_priority"):
             merged["tradeoff_priority"] = "我不確定"
-        elif required_slot == "brand_priority" and not merged.get("brand_priority"):
+            pending_slots.discard("tradeoff_priority")
+        elif pre_required_slot == "brand_priority" and not merged.get("brand_priority"):
             merged["brand_priority"] = "兩者都重視"
+            pending_slots.discard("brand_priority")
+
+    if pending_slots:
+        merged["_pending_slots"] = sorted(pending_slots)
+    else:
+        merged.pop("_pending_slots", None)
+
+    required_slot = _next_required_slot_for_slots(merged, normalized_text)
 
     _debug_log(
         "slot_extract_merged",
@@ -1412,7 +1475,9 @@ def _bridge_cross_domain_preference_for_perm(merged_slots, rule_slots, normalize
     if _has_any_phrase(
         normalized_text,
         (
+            "重視髮質",
             "重視髮質修護",
+            "在意髮質",
             "我在意髮質",
             "髮質很重要",
             "重視修護",
@@ -1652,6 +1717,12 @@ def _parse_budget_constraint(text):
     if over_match:
         return {"min": int(over_match.group(1)), "max": None}
 
+    # Single-number hints like "2000左右/大概2000/2000塊"
+    single_match = re.search(r"(\d{3,5})\s*(元|塊|块)?\s*(左右|大概|約|约)?", content)
+    if single_match:
+        amount = int(single_match.group(1))
+        return {"min": amount, "max": amount}
+
     return None
 
 
@@ -1679,23 +1750,78 @@ def _budget_constraint_from_budget_range(budget_range, normalized_text):
     return {"min": parsed.get("min"), "max": parsed.get("max")}
 
 
-def _has_user_slot_evidence(slot_key, value, normalized_text):
+def _slot_evidence_level(slot_key, value, normalized_text):
+    """Return one of: explicit, derived, none."""
     if not value:
-        return False
+        return "none"
 
     if slot_key == "bleach_accept":
         # Must be explicit user stance; question intent is not acceptance.
-        return _infer_bleach_accept_from_text(normalized_text) == value
+        return "explicit" if _infer_bleach_accept_from_text(normalized_text) == value else "none"
 
     if slot_key == "budget_range":
-        return _detect_budget_range(normalized_text) == value
+        return "explicit" if _detect_budget_range(normalized_text) == value else "none"
+
+    if slot_key == "perm_blocker":
+        return "explicit" if _slot_value_supported_by_user_text(slot_key, value, normalized_text) else "none"
 
     if slot_key == "current_base":
         inferred = _infer_current_base_candidate_from_text(normalized_text)
-        if inferred == value:
-            return True
+        if inferred == value or _slot_value_supported_by_user_text(slot_key, value, normalized_text):
+            return "explicit"
+        return "derived"
 
-    return _slot_value_supported_by_user_text(slot_key, value, normalized_text)
+    if _slot_value_supported_by_user_text(slot_key, value, normalized_text):
+        return "explicit"
+
+    if slot_key in {
+        "direction",
+        "dye_detail",
+        "target_color",
+        "brand_priority",
+        "tradeoff_priority",
+        "perm_detail",
+        "perm_preference",
+        "treatment_detail",
+    }:
+        return "derived"
+
+    return "none"
+
+
+def _slot_requires_confirmation(slot_key):
+    return slot_key in {
+        "dye_detail",
+        "perm_detail",
+        "current_base",
+        "perm_preference",
+        "brand_priority",
+        "tradeoff_priority",
+    }
+
+
+def _pending_slots_set(slots):
+    if not isinstance(slots, dict):
+        return set()
+    pending = slots.get("_pending_slots")
+    if not isinstance(pending, (list, tuple, set)):
+        return set()
+    return {item for item in pending if isinstance(item, str)}
+
+
+def _slot_value_for_flow(slots, slot_key):
+    if slot_key in _pending_slots_set(slots):
+        return None
+    return (slots or {}).get(slot_key)
+
+
+def _slots_with_confirmed_values(slots):
+    if not isinstance(slots, dict):
+        return {}
+    result = dict(slots)
+    for slot_key in _pending_slots_set(slots):
+        result[slot_key] = None
+    return result
 
 
 def _slot_value_supported_by_user_text(slot_key, value, normalized_text):
