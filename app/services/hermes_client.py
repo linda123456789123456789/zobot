@@ -322,7 +322,11 @@ def _get_mock_reply(input_mode, conversation_style, message, history, system_pro
         allow_inferred_recommendation = task_ready
     final_output = None
     if conversation_style == "task" and allow_inferred_recommendation:
-        final_output = _build_task_text_final_output(conversation_text)
+        if input_mode == "text":
+            slots = _task_free_text_slots_from_history(history, message)
+            final_output = _build_task_text_final_output_from_slots(slots)
+        else:
+            final_output = _build_task_text_final_output(conversation_text)
     if not final_output:
         final_output = _build_final_output(
             conversation_text,
@@ -669,8 +673,14 @@ def _force_final_at_turn_limit(model_response, input_mode, conversation_style, m
 
     if model_response["is_final"]:
         if task_mode and not task_ready:
+            if task_text_mode:
+                conversation_text = _conversation_text(history, message)
+                slots = _task_free_text_slots_from_history(history, message)
+                reply = _next_task_free_text_question(conversation_text, message, slots=slots)
+            else:
+                reply = _next_task_free_text_question(_conversation_text(history, message), message)
             return {
-                "reply": _next_task_free_text_question(_conversation_text(history, message), message),
+                "reply": reply,
                 "buttons": model_response.get("buttons") or [],
                 "source": model_response.get("source"),
                 "is_final": False,
@@ -1036,36 +1046,36 @@ def _advance_task_fsm_state(state):
 
 
 def _consume_latest_message_for_task_fsm(state, normalized_message):
+    """Consume ONLY the latest user message for the current FSM slot.
+
+    Step 4: no full-conversation slot extraction and no multi-slot harvesting
+    from one message. The parser may only fill the currently active slot.
+    """
     slots = state.get("slots") or {}
-    consumed_slots = set()
+    current_slot = state.get("current_slot")
 
-    # A single user message may contain answers for consecutive upcoming slots
-    # ("全頭染，想染可可棕"). Consume only the current slot path in order.
-    for _ in range(len(TASK_SLOT_ENUMS) + 2):
-        context_text = _slots_to_normalized_text(slots)
-        required_slot = _next_required_slot_for_slots(slots, context_text)
-        if required_slot is None:
-            break
-        if required_slot == "budget_adjustment":
-            required_slot = "tradeoff_priority"
-        if required_slot in consumed_slots:
-            break
+    if not current_slot or current_slot == "recommend":
+        state["slots"] = slots
+        return
 
-        value = _extract_value_for_current_task_slot(
-            required_slot,
-            normalized_message,
-            slots,
-        )
-        if value is None:
-            break
+    if current_slot == "budget_adjustment":
+        current_slot = "tradeoff_priority"
 
-        slots[required_slot] = value
-        consumed_slots.add(required_slot)
+    value = _extract_value_for_current_task_slot(
+        current_slot,
+        normalized_message,
+        slots,
+    )
+    if value is None:
+        state["slots"] = slots
+        return
 
-        if required_slot == "direction":
-            _clear_cross_direction_slots(slots)
+    slots[current_slot] = value
+    if current_slot == "direction":
+        _clear_cross_direction_slots(slots)
 
     state["slots"] = slots
+    _debug_log("task_fsm_current_slot_parsed", current_slot=current_slot, value=value)
 
 
 def _apply_pending_confirmation_response(state, normalized_message):
@@ -1461,7 +1471,7 @@ def _is_followup_question(text):
 def _task_followup_explanation(conversation_text, user_message, slots=None):
     text = _normalize_task_free_text(conversation_text)
     message = _normalize_task_free_text(user_message)
-    slots = dict(slots or _extract_task_slots(text))
+    slots = dict(slots or _empty_task_slots())
     direction = slots.get("direction")
     if direction == "燙髮":
         if _has_any_phrase(message, ("差別", "差在哪", "不同", "比較")):
@@ -1498,7 +1508,7 @@ def _task_followup_explanation(conversation_text, user_message, slots=None):
 
 def _difference_explanation_for_next_slot(conversation_text, slots=None):
     text = _normalize_task_free_text(conversation_text)
-    slots = dict(slots or _extract_task_slots(text))
+    slots = dict(slots or _empty_task_slots())
     direction = slots.get("direction")
 
     if direction == "染髮":
@@ -1593,7 +1603,7 @@ def _extract_target_color_hint(normalized_text):
 
 def _next_task_free_text_question(conversation_text, latest_user_message="", slots=None):
     text = _normalize_task_free_text(conversation_text)
-    slots = dict(slots or _extract_task_slots(text))
+    slots = dict(slots or _empty_task_slots())
     flow_slots = _slots_with_confirmed_values(slots)
     direction = flow_slots.get("direction")
 
@@ -1829,100 +1839,12 @@ def _extract_task_free_text_slots_rule(text):
 
 
 def _extract_task_slots(text):
-    return _extract_task_slots_cached(_normalize_task_free_text(text))
+    """Legacy helper retained for non-FSM callers.
 
-
-@lru_cache(maxsize=128)
-def _extract_task_slots_cached(normalized_text):
-    rule_slots = _extract_task_free_text_slots_rule(normalized_text)
-    llm_slots = _extract_task_slots_with_llm(normalized_text)
-    if not llm_slots:
-        _debug_log("slot_extract_rule_only", text_preview=normalized_text[:100], slots=rule_slots)
-        return rule_slots
-
-    merged = dict(rule_slots)
-    pending_slots = set()
-    llm_confidence = {}
-    for slot_key in TASK_SLOT_ENUMS:
-        llm_value = llm_slots.get(slot_key)
-        if llm_value not in TASK_SLOT_ENUMS[slot_key]:
-            continue
-        # Keep rule-extracted value first; let LLM fill with evidence levels.
-        if merged.get(slot_key):
-            continue
-        evidence_level = _slot_evidence_level(slot_key, llm_value, normalized_text)
-        if evidence_level == "none":
-            continue
-        if slot_key == "target_color":
-            confidence = _llm_target_color_confidence(llm_value, normalized_text)
-            llm_confidence[slot_key] = confidence
-            merged[slot_key] = llm_value
-            if evidence_level == "derived" and _slot_requires_confirmation(slot_key):
-                pending_slots.add(slot_key)
-            continue
-        if slot_key == "current_base":
-            confidence = _llm_current_base_confidence(llm_value, normalized_text)
-            llm_confidence[slot_key] = confidence
-            merged[slot_key] = llm_value
-            if evidence_level == "derived" and _slot_requires_confirmation(slot_key):
-                pending_slots.add(slot_key)
-            continue
-        merged[slot_key] = llm_value
-        if evidence_level == "derived" and _slot_requires_confirmation(slot_key):
-            pending_slots.add(slot_key)
-
-    llm_budget = llm_slots.get("budget_range")
-    if not merged.get("budget_range") and llm_budget:
-        budget_evidence = _slot_evidence_level("budget_range", llm_budget, normalized_text)
-        if budget_evidence != "none":
-            merged["budget_range"] = llm_budget
-            if budget_evidence == "derived" and _slot_requires_confirmation("budget_range"):
-                pending_slots.add("budget_range")
-
-    # Backfill direction when user wording is implicit (e.g. "全頭染粉色頭髮")
-    # but downstream dye/perm/treatment slots are already clear.
-    if not merged.get("direction"):
-        inferred_direction = (
-            _infer_direction_from_slot_bundle(merged)
-            or _infer_direction_from_slot_bundle(llm_slots)
-            or _infer_direction_from_slot_bundle(rule_slots)
-        )
-        if inferred_direction:
-            merged["direction"] = inferred_direction
-
-    _bridge_cross_domain_preference_for_perm(merged, rule_slots, normalized_text)
-    _clear_cross_direction_slots(merged)
-
-    # Let uncertain answers only fill the currently required slot.
-    pre_required_slot = _next_required_slot_for_slots(merged, normalized_text)
-    if _is_uncertain_reply_text(normalized_text):
-        if pre_required_slot == "budget_range" and not merged.get("budget_range"):
-            merged["budget_range"] = BUDGET_NO_PREFERENCE
-            pending_slots.discard("budget_range")
-        elif pre_required_slot == "tradeoff_priority" and not merged.get("tradeoff_priority"):
-            merged["tradeoff_priority"] = "我不確定"
-            pending_slots.discard("tradeoff_priority")
-        elif pre_required_slot == "brand_priority" and not merged.get("brand_priority"):
-            merged["brand_priority"] = "兩者都重視"
-            pending_slots.discard("brand_priority")
-
-    if pending_slots:
-        merged["_pending_slots"] = sorted(pending_slots)
-    else:
-        merged.pop("_pending_slots", None)
-
-    required_slot = _next_required_slot_for_slots(merged, normalized_text)
-
-    _debug_log(
-        "slot_extract_merged",
-        text_preview=normalized_text[:100],
-        llm_slots=llm_slots,
-        rule_slots=rule_slots,
-        llm_confidence=llm_confidence,
-        required_slot=required_slot,
-        merged_slots=merged,
-    )
-    return merged
+    Step 4 removes LLM/global slot extraction from task-led free-text flow.
+    This fallback is rule-only and should not be used to drive task FSM state.
+    """
+    return _extract_task_free_text_slots_rule(_normalize_task_free_text(text))
 
 
 def _bridge_cross_domain_preference_for_perm(merged_slots, rule_slots, normalized_text):
