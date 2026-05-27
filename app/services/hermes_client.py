@@ -95,7 +95,17 @@ TASK_SLOT_KEYWORDS = {
     "current_base": {
         "自然黑髮": ("自然黑髮", "黑髮", "原生髮", "沒染過"),
         "已染深色/中深色": ("已染深色", "染過深色", "中深色", "咖啡色底", "深棕底"),
-        "已染淺色/已漂過": ("已染淺色", "已漂過", "漂過", "淺色底", "金色底"),
+        "已染淺色/已漂過": (
+            "已染淺色",
+            "已漂過",
+            "漂過",
+            "淺色底",
+            "金色底",
+            "金色髮色",
+            "金色頭髮",
+            "金髮",
+            "目前是金色",
+        ),
     },
     "bleach_accept": {
         "可接受漂髮": ("可接受漂髮", "可以漂", "可漂", "接受漂", "能漂", "可以接受漂髮"),
@@ -668,7 +678,8 @@ def _force_final_at_turn_limit(model_response, input_mode, conversation_style, m
             }
         if task_text_mode and task_ready:
             conversation_text = _conversation_text(history, message)
-            final_output = _build_task_text_final_output(conversation_text)
+            slots = _task_free_text_slots_from_history(history, message)
+            final_output = _build_task_text_final_output_from_slots(slots)
             if final_output:
                 return {
                     "reply": "我已根據你的需求整理出一個參考建議，請查看下方摘要。",
@@ -709,7 +720,8 @@ def _force_final_at_turn_limit(model_response, input_mode, conversation_style, m
 
     if task_text_mode:
         if task_ready:
-            final_output = _build_task_text_final_output(conversation_text)
+            slots = _task_free_text_slots_from_history(history, message)
+            final_output = _build_task_text_final_output_from_slots(slots)
             if final_output:
                 return {
                     "reply": "我已根據你的需求整理出一個參考建議，請查看下方摘要。",
@@ -863,6 +875,10 @@ def _is_task_ready(input_mode, conversation_style, history, message):
     if _is_task_button_mode(input_mode, conversation_style):
         return get_task_guided_prompt(history) is None
 
+    if input_mode == "text":
+        slots = _task_free_text_slots_from_history(history, message)
+        return _is_task_free_text_ready_from_slots(slots)
+
     conversation_text = _conversation_text(history, message)
     return _is_task_free_text_ready(conversation_text)
 
@@ -872,6 +888,434 @@ def _is_task_button_ready(input_mode, conversation_style, history):
         return False
     return get_task_guided_prompt(history) is None
 
+
+
+
+def _empty_task_slots():
+    slots = {"budget_range": None}
+    for slot_key in TASK_SLOT_ENUMS:
+        slots[slot_key] = None
+    return slots
+
+
+def _task_user_messages(history, message):
+    messages = []
+    if isinstance(history, list):
+        for item in history:
+            if isinstance(item, dict) and item.get("role") == "user":
+                content = str(item.get("content") or "").strip()
+                if content:
+                    messages.append(content)
+
+    latest = str(message or "").strip()
+    if latest and (not messages or messages[-1] != latest):
+        messages.append(latest)
+    return messages
+
+
+def _task_turn_items(history, message):
+    """Return ordered user/assistant turns for deterministic FSM replay.
+
+    Step 2+3 reconstructs persistent task state from chat history. Assistant
+    confirmation questions are needed so that a later "是的/對" can commit the
+    pending slot instead of causing a repeated confirmation loop.
+    """
+    turns = []
+    if isinstance(history, list):
+        for item in history:
+            if not isinstance(item, dict):
+                continue
+            role = item.get("role")
+            if role not in {"user", "assistant"}:
+                continue
+            content = str(item.get("content") or "").strip()
+            if content:
+                turns.append({"role": role, "content": content})
+
+    latest = str(message or "").strip()
+    if latest:
+        if not turns or turns[-1].get("role") != "user" or turns[-1].get("content") != latest:
+            turns.append({"role": "user", "content": latest})
+    return turns
+
+
+def _slots_to_normalized_text(slots):
+    if not isinstance(slots, dict):
+        return ""
+    parts = []
+    for key in (
+        "direction",
+        "dye_detail",
+        "target_color",
+        "current_base",
+        "bleach_accept",
+        "brand_priority",
+        "perm_detail",
+        "perm_blocker",
+        "perm_preference",
+        "treatment_detail",
+        "budget_range",
+        "tradeoff_priority",
+    ):
+        value = slots.get(key)
+        if value:
+            parts.append(str(value))
+    return _normalize_task_free_text(" ".join(parts))
+
+
+def _task_free_text_slots_from_history(history, message):
+    """Replay a persistent task FSM state from history.
+
+    This is Step 2 + Step 3:
+    - Step 2: keep a real FSM-shaped state: slots/current_slot/pending_confirmation.
+    - Step 3: when the previous assistant turn asked for confirmation, commit or
+      clear that pending value based on the user's affirmative/negative reply.
+
+    The function intentionally does NOT run full-conversation slot extraction.
+    Each user message is interpreted only against the current required slot.
+    """
+    state = _initial_task_fsm_state()
+
+    for turn in _task_turn_items(history, message):
+        role = turn.get("role")
+        content = str(turn.get("content") or "")
+        normalized_message = _normalize_task_free_text(content)
+
+        if role == "assistant":
+            pending = _pending_confirmation_from_assistant(content)
+            if pending:
+                slot = pending.get("slot")
+                value = pending.get("value")
+                if slot and value and not state["slots"].get(slot):
+                    state["pending_confirmation"] = pending
+                    state["current_slot"] = slot
+                    _debug_log("task_fsm_pending_set", pending=pending)
+            continue
+
+        if role != "user" or not normalized_message:
+            continue
+
+        if _apply_pending_confirmation_response(state, normalized_message):
+            _advance_task_fsm_state(state)
+            continue
+
+        # If the user explicitly rejects the pending interpretation, keep the
+        # same current_slot and parse this latest message as a replacement answer
+        # only when it contains one.
+        if state.get("pending_confirmation") and _is_negative_reply_text(normalized_message):
+            _debug_log("task_fsm_pending_rejected", pending=state.get("pending_confirmation"))
+            state["pending_confirmation"] = None
+
+        _consume_latest_message_for_task_fsm(state, normalized_message)
+        _advance_task_fsm_state(state)
+
+    _debug_log(
+        "task_fsm_state",
+        slots=state.get("slots"),
+        current_slot=state.get("current_slot"),
+        pending_confirmation=state.get("pending_confirmation"),
+    )
+    return state["slots"]
+
+
+def _initial_task_fsm_state():
+    return {
+        "slots": _empty_task_slots(),
+        "current_slot": "direction",
+        "pending_confirmation": None,
+    }
+
+
+def _advance_task_fsm_state(state):
+    slots = state.get("slots") or {}
+    context_text = _slots_to_normalized_text(slots)
+    required_slot = _next_required_slot_for_slots(slots, context_text)
+    if required_slot == "budget_adjustment":
+        required_slot = "tradeoff_priority"
+    state["current_slot"] = required_slot or "recommend"
+
+
+def _consume_latest_message_for_task_fsm(state, normalized_message):
+    slots = state.get("slots") or {}
+    consumed_slots = set()
+
+    # A single user message may contain answers for consecutive upcoming slots
+    # ("全頭染，想染可可棕"). Consume only the current slot path in order.
+    for _ in range(len(TASK_SLOT_ENUMS) + 2):
+        context_text = _slots_to_normalized_text(slots)
+        required_slot = _next_required_slot_for_slots(slots, context_text)
+        if required_slot is None:
+            break
+        if required_slot == "budget_adjustment":
+            required_slot = "tradeoff_priority"
+        if required_slot in consumed_slots:
+            break
+
+        value = _extract_value_for_current_task_slot(
+            required_slot,
+            normalized_message,
+            slots,
+        )
+        if value is None:
+            break
+
+        slots[required_slot] = value
+        consumed_slots.add(required_slot)
+
+        if required_slot == "direction":
+            _clear_cross_direction_slots(slots)
+
+    state["slots"] = slots
+
+
+def _apply_pending_confirmation_response(state, normalized_message):
+    pending = state.get("pending_confirmation")
+    if not pending:
+        return False
+
+    slot = pending.get("slot")
+    value = pending.get("value")
+    if not slot or not value:
+        state["pending_confirmation"] = None
+        return False
+
+    if _is_affirmative_reply_text(normalized_message):
+        state["slots"][slot] = value
+        state["pending_confirmation"] = None
+        _debug_log("task_fsm_pending_committed", slot=slot, value=value)
+        return True
+
+    if _is_negative_reply_text(normalized_message):
+        state["pending_confirmation"] = None
+        state["current_slot"] = slot
+        _debug_log("task_fsm_pending_cleared", slot=slot, value=value)
+        return False
+
+    return False
+
+
+def _pending_confirmation_from_assistant(assistant_text):
+    text = str(assistant_text or "").strip()
+    if not text:
+        return None
+
+    patterns = (
+        (r"我先理解成你目前底色是「([^」]+)」，這樣對嗎", "current_base"),
+        (r"你目前底色比較像「([^」]+)」，這樣對嗎", "current_base"),
+        (r"我先理解成你這次是(全頭染|補染)，這樣對嗎", "dye_detail"),
+        (r"我先理解成你這次是(整體燙髮)，這樣對嗎", "perm_detail"),
+        (r"我先理解成你想做(髮根燙|燙瀏海)，這樣對嗎", "perm_detail"),
+        (r"我先理解成你是(重視燙後髮質與修護感)，這樣對嗎", "perm_preference"),
+        (r"我先理解成你偏向(先平衡預算完成基本造型)，這樣對嗎", "perm_preference"),
+        (r"我先理解成你這次偏好是「([^」]+)」，這樣對嗎", "brand_priority"),
+        (r"我先理解成你想以「([^」]+)」為主，這樣對嗎", "tradeoff_priority"),
+    )
+
+    for pattern, slot in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        raw_value = match.group(1).strip()
+        value = _normalize_pending_confirmation_value(slot, raw_value)
+        if value:
+            return {"slot": slot, "value": value}
+
+    return None
+
+
+def _normalize_pending_confirmation_value(slot_key, raw_value):
+    value = str(raw_value or "").strip()
+    if not value:
+        return None
+
+    if slot_key == "dye_detail":
+        if "全頭" in value:
+            return "全頭染"
+        if "補染" in value:
+            return "補染"
+
+    if slot_key == "current_base":
+        normalized = _normalize_llm_slot_value("current_base", value)
+        if normalized in TASK_SLOT_ENUMS["current_base"]:
+            return normalized
+
+    if slot_key == "perm_detail":
+        if "整體" in value:
+            return "整體燙髮"
+        if "髮根" in value:
+            return "髮根燙"
+        if "瀏海" in value:
+            return "燙瀏海"
+
+    if slot_key == "perm_preference":
+        if "修護" in value or "髮質" in value:
+            return "重視燙後髮質、柔順度與修護感"
+        if "預算" in value or "基本" in value:
+            return "平衡預算，完成基本燙髮造型"
+
+    if slot_key == "brand_priority":
+        if value in TASK_SLOT_ENUMS["brand_priority"]:
+            return value
+        if "修護" in value or "髮質" in value:
+            return "重視染後髮質修護"
+        if "顏色" in value or "CP" in value.upper() or "cp" in value:
+            return "重視顏色表現與CP值"
+
+    if slot_key == "tradeoff_priority":
+        if "預算" in value or "價格" in value:
+            return "以預算為優先"
+        if "效果" in value or "髮質" in value or "修護" in value:
+            return "以效果為優先"
+
+    allowed = TASK_SLOT_ENUMS.get(slot_key)
+    if allowed and value in allowed:
+        return value
+    return None
+
+
+def _extract_value_for_current_task_slot(slot_key, normalized_message, current_slots):
+    if slot_key == "direction":
+        return _detect_direction(normalized_message)
+
+    if slot_key == "budget_range":
+        budget = _detect_budget_range(normalized_message)
+        if budget:
+            return budget
+        if _is_uncertain_reply_text(normalized_message):
+            return BUDGET_NO_PREFERENCE
+        return None
+
+    if slot_key == "budget_adjustment":
+        return _extract_value_for_current_task_slot("tradeoff_priority", normalized_message, current_slots)
+
+    if slot_key == "brand_priority":
+        if _has_any_phrase(
+            normalized_message,
+            (
+                "毛躁",
+                "乾",
+                "乾燥",
+                "受損",
+                "髮質",
+                "修護",
+                "護髮",
+                "柔順",
+                "打結",
+                "分岔",
+                "分叉",
+            ),
+        ):
+            return "重視染後髮質修護"
+        if _has_any_phrase(
+            normalized_message,
+            (
+                "顯色",
+                "顏色",
+                "cp",
+                "cp值",
+                "cp 值",
+                "便宜",
+                "價格",
+                "預算",
+                "划算",
+                "效果",
+            ),
+        ):
+            return "重視顏色表現與CP值"
+        if _is_uncertain_reply_text(normalized_message):
+            return "兩者都重視"
+
+    if slot_key == "tradeoff_priority":
+        if _has_any_phrase(normalized_message, ("效果", "顯色", "髮質", "修護", "護理")):
+            return "以效果為優先"
+        if _has_any_phrase(normalized_message, ("預算", "價格", "便宜", "省錢", "cp", "cp值", "cp 值")):
+            return "以預算為優先"
+        if _is_uncertain_reply_text(normalized_message):
+            return "我不確定"
+
+    if slot_key == "bleach_accept":
+        if _has_any_phrase(normalized_message, ("不想漂", "不想要漂", "不要漂", "不漂", "不能漂", "不可以漂", "不接受漂")):
+            return "希望不漂髮"
+        if _has_any_phrase(normalized_message, ("可以漂", "可漂", "接受漂", "能漂", "願意漂")):
+            return "可接受漂髮"
+        return None
+
+    candidates = TASK_SLOT_KEYWORDS.get(slot_key)
+    if candidates:
+        value = _detect_slot_value(normalized_message, candidates)
+        if value:
+            return value
+
+    if slot_key == "perm_blocker" and _has_any_phrase(normalized_message, ("沒有", "都沒有", "無", "以上皆無")):
+        return "以上皆無"
+
+    return None
+
+
+def _is_task_free_text_ready_from_slots(slots):
+    if not isinstance(slots, dict):
+        return False
+    direction = slots.get("direction")
+    if direction is None:
+        return False
+
+    context_text = _slots_to_normalized_text(slots)
+
+    if direction == "染髮":
+        detail = _normalized_dye_detail(slots.get("dye_detail"))
+        if not detail:
+            return False
+        if detail == "補染":
+            return True
+        if detail != "全頭染":
+            return False
+        if not slots.get("target_color") or not slots.get("current_base"):
+            return False
+        if _needs_bleach_for_slots(slots) and not slots.get("bleach_accept"):
+            return False
+        if not slots.get("brand_priority"):
+            return False
+        candidates = _candidate_services_for_task_slots(slots)
+        if len(candidates) <= 1:
+            return True
+        if not slots.get("budget_range"):
+            return False
+        if _needs_tradeoff_priority(slots, context_text):
+            return bool(slots.get("tradeoff_priority"))
+        if _has_budget_compatible_candidates(slots, context_text):
+            return True
+        return slots.get("tradeoff_priority") == "以效果為優先" and len(candidates) > 0
+
+    if direction == "燙髮":
+        if not slots.get("perm_detail") or not slots.get("perm_blocker"):
+            return False
+        if slots.get("perm_blocker") in PERM_HARD_BLOCKERS:
+            return True
+        if slots.get("perm_detail") in {"髮根燙", "燙瀏海"}:
+            return True
+        if not slots.get("perm_preference") or not slots.get("budget_range"):
+            return False
+        if slots.get("perm_preference") in {
+            "平衡預算，完成基本燙髮造型",
+            "重視燙後髮質、柔順度與修護感",
+        }:
+            return True
+        if _needs_tradeoff_priority(slots, context_text):
+            return bool(slots.get("tradeoff_priority"))
+        if _has_budget_compatible_candidates(slots, context_text):
+            return True
+        return slots.get("tradeoff_priority") == "以效果為優先" and len(_candidate_services_for_task_slots(slots)) > 0
+
+    if direction == "護髮":
+        if not slots.get("treatment_detail") or not slots.get("budget_range"):
+            return False
+        if _needs_tradeoff_priority(slots, context_text):
+            return bool(slots.get("tradeoff_priority"))
+        if _has_budget_compatible_candidates(slots, context_text):
+            return True
+        return slots.get("tradeoff_priority") == "以效果為優先" and len(_candidate_services_for_task_slots(slots)) > 0
+
+    return False
 
 def _is_task_free_text_ready(conversation_text):
     text = _normalize_task_free_text(conversation_text)
@@ -1014,10 +1458,10 @@ def _is_followup_question(text):
     )
 
 
-def _task_followup_explanation(conversation_text, user_message):
+def _task_followup_explanation(conversation_text, user_message, slots=None):
     text = _normalize_task_free_text(conversation_text)
     message = _normalize_task_free_text(user_message)
-    slots = _extract_task_slots(text)
+    slots = dict(slots or _extract_task_slots(text))
     direction = slots.get("direction")
     if direction == "燙髮":
         if _has_any_phrase(message, ("差別", "差在哪", "不同", "比較")):
@@ -1028,7 +1472,7 @@ def _task_followup_explanation(conversation_text, user_message):
         return ""
 
     if _has_any_phrase(message, ("差別", "差在哪", "不同", "比較")):
-        return _difference_explanation_for_next_slot(conversation_text)
+        return _difference_explanation_for_next_slot(conversation_text, slots=slots)
 
     if _has_any_phrase(message, ("需要漂", "要不要漂", "漂髮嗎", "會不會漂", "能不能不漂")):
         target = slots.get("target_color")
@@ -1052,9 +1496,9 @@ def _task_followup_explanation(conversation_text, user_message):
     return ""
 
 
-def _difference_explanation_for_next_slot(conversation_text):
+def _difference_explanation_for_next_slot(conversation_text, slots=None):
     text = _normalize_task_free_text(conversation_text)
-    slots = _extract_task_slots(text)
+    slots = dict(slots or _extract_task_slots(text))
     direction = slots.get("direction")
 
     if direction == "染髮":
@@ -1098,9 +1542,10 @@ def _guard_task_reply_if_not_ready(reply, ready, input_mode, history, message):
 
     if input_mode == "text":
         conversation_text = _conversation_text(history, message)
-        next_question = _next_task_free_text_question(conversation_text, message)
+        slots = _task_free_text_slots_from_history(history, message)
+        next_question = _next_task_free_text_question(conversation_text, message, slots=slots)
         if _is_followup_question(message):
-            explanation = _task_followup_explanation(conversation_text, message)
+            explanation = _task_followup_explanation(conversation_text, message, slots=slots)
             ai_reply = content.strip()
             if _looks_like_recommendation_text(ai_reply):
                 ai_reply = ""
@@ -1146,9 +1591,9 @@ def _extract_target_color_hint(normalized_text):
     return ""
 
 
-def _next_task_free_text_question(conversation_text, latest_user_message=""):
+def _next_task_free_text_question(conversation_text, latest_user_message="", slots=None):
     text = _normalize_task_free_text(conversation_text)
-    slots = _extract_task_slots(text)
+    slots = dict(slots or _extract_task_slots(text))
     flow_slots = _slots_with_confirmed_values(slots)
     direction = flow_slots.get("direction")
 
@@ -2285,6 +2730,107 @@ def _build_task_text_final_output(conversation_text):
 
     slots = _extract_task_slots(normalized_text)
     if _has_no_bleach_constraint(slots, normalized_text):
+        slots["bleach_accept"] = "希望不漂髮"
+
+    if slots.get("direction") == "燙髮" and slots.get("perm_blocker") in PERM_HARD_BLOCKERS:
+        return _blocked_perm_final_output(slots.get("perm_blocker"))
+
+    ranked_candidates = _candidate_services_for_task_slots(slots)
+    if not ranked_candidates:
+        return None
+
+    if slots.get("direction") == "染髮" and _normalized_dye_detail(slots.get("dye_detail")) == "補染":
+        service_name = ranked_candidates[0]
+        if service_name not in SERVICE_HINTS:
+            return None
+        reason = _build_task_recommendation_reason(
+            service_name,
+            slots,
+            normalized_text,
+            ranked_candidates=ranked_candidates,
+        )
+        return _final_output_for(service_name, reason=reason)
+
+    if (
+        slots.get("direction") == "染髮"
+        and _normalized_dye_detail(slots.get("dye_detail")) == "全頭染"
+        and _needs_bleach_for_slots(slots)
+        and slots.get("bleach_accept") == "可接受漂髮"
+    ):
+        service_name = ranked_candidates[0]
+        if service_name not in SERVICE_HINTS:
+            return None
+        reason = _build_task_recommendation_reason(
+            service_name,
+            slots,
+            normalized_text,
+            ranked_candidates=ranked_candidates,
+        )
+        return _final_output_for(service_name, reason=reason)
+
+    if slots.get("direction") == "燙髮":
+        detail = slots.get("perm_detail")
+        preference = slots.get("perm_preference")
+        if detail in {"髮根燙", "燙瀏海"}:
+            service_name = ranked_candidates[0]
+            if service_name not in SERVICE_HINTS:
+                return None
+            reason = _build_task_recommendation_reason(
+                service_name,
+                slots,
+                normalized_text,
+                ranked_candidates=ranked_candidates,
+            )
+            return _final_output_for(service_name, reason=reason)
+
+        if preference in {"平衡預算，完成基本燙髮造型", "重視燙後髮質、柔順度與修護感"}:
+            service_name = ranked_candidates[0]
+            if service_name not in SERVICE_HINTS:
+                return None
+            reason = _build_task_recommendation_reason(
+                service_name,
+                slots,
+                normalized_text,
+                ranked_candidates=ranked_candidates,
+            )
+            return _final_output_for(service_name, reason=reason)
+
+    budget_range = slots.get("budget_range")
+    if _is_budget_no_preference_value(budget_range, normalized_text):
+        filtered = ranked_candidates
+    else:
+        filtered = _filter_services_by_budget(ranked_candidates, budget_range, normalized_text)
+    if not filtered and slots.get("tradeoff_priority") != "以效果為優先":
+        return None
+
+    use_candidates = filtered
+    if _needs_tradeoff_priority(slots, normalized_text):
+        priority = slots.get("tradeoff_priority")
+        if priority == "以效果為優先":
+            use_candidates = ranked_candidates
+        elif priority in {"以預算為優先", "我不確定"}:
+            use_candidates = filtered
+        else:
+            return None
+
+    if not use_candidates:
+        return None
+
+    service_name = use_candidates[0]
+    if service_name not in SERVICE_HINTS:
+        return None
+    reason = _build_task_recommendation_reason(service_name, slots, normalized_text, ranked_candidates=use_candidates)
+    return _final_output_for(service_name, reason=reason)
+
+
+
+def _build_task_text_final_output_from_slots(slots):
+    if not isinstance(slots, dict):
+        return None
+
+    normalized_text = _slots_to_normalized_text(slots)
+    if _has_no_bleach_constraint(slots, normalized_text):
+        slots = dict(slots)
         slots["bleach_accept"] = "希望不漂髮"
 
     if slots.get("direction") == "燙髮" and slots.get("perm_blocker") in PERM_HARD_BLOCKERS:
