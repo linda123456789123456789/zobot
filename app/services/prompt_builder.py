@@ -4,9 +4,9 @@ from pathlib import Path
 
 from app.services.service_catalog import SERVICE_OPTIONS
 
-TASK_TURN_LIMIT = 8
-TOPIC_TURN_LIMIT = 10
-TASK_BUTTON_TURN_LIMIT = 8
+TASK_TURN_LIMIT = 15
+TOPIC_TURN_LIMIT = 15
+TASK_BUTTON_TURN_LIMIT = 15
 TASK_BUTTON_HARD_LIMIT = 12
 RECENT_QUESTION_WINDOW = 6
 PROMPT_ROOT = Path(__file__).resolve().parents[2] / "ZOSS_AI"
