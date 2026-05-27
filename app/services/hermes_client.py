@@ -456,6 +456,26 @@ def _get_ollama_reply(input_mode, conversation_style, message, history, system_p
             conversation_style=conversation_style,
             raw_preview=(text or "")[:180],
         )
+        # Step 1: In task-led mode, do not let non-JSON Ollama text control the dialogue.
+        # Task-led flow must be controlled by the deterministic controller/FSM guard.
+        # The model may fail to return JSON, but its natural-language text should not be
+        # displayed as the next bot reply because that reintroduces LLM-driven flow.
+        if conversation_style == "task":
+            controller_response = {
+                "reply": "",
+                "buttons": [],
+                "source": "ollama_json_parse_failed_controller",
+                "is_final": False,
+                "final_output": None,
+            }
+            return _force_final_at_turn_limit(
+                controller_response,
+                input_mode=input_mode,
+                conversation_style=conversation_style,
+                message=message,
+                history=history,
+            )
+
         natural_reply = _sanitize_template_reply(str(text or "").strip())
         if natural_reply:
             fallback_response = {
