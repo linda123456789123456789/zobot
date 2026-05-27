@@ -251,6 +251,12 @@ SERVICE_PRICE_BOUNDS = _service_price_bounds()
 
 
 def get_chatbot_reply(input_mode, conversation_style, message, history, system_prompt):
+    # Step 1: task-led + free-text is controller-led.
+    # The controller owns the main slot-collection flow, while AI is still used
+    # only by bounded helpers such as semantic slot classification.
+    if input_mode == "text" and conversation_style == "task":
+        return _get_task_text_controller_reply(message, history)
+
     if _is_task_button_mode(input_mode, conversation_style):
         deterministic_response = _build_task_button_ready_response(history, message)
         if deterministic_response:
@@ -283,6 +289,186 @@ def get_chatbot_reply(input_mode, conversation_style, message, history, system_p
         system_prompt=system_prompt,
     )
 
+
+
+def _get_task_text_controller_reply(message, history):
+    """Controller-led task + free-text response.
+
+    Step 2:
+    - FSM controls the main slot-collection flow.
+    - User side questions are treated as interrupts and do not fill slots.
+    - Semantic AI classification remains available only inside slot parsing.
+    """
+    latest_message = str(message or "").strip()
+    slots_before = _task_free_text_slots_from_history(history, "")
+    current_slot = _current_task_slot_from_slots(slots_before)
+    normalized_message = _normalize_task_free_text(latest_message)
+    intent = _detect_task_interrupt_intent(normalized_message, current_slot, slots_before)
+
+    if intent.get("type") != "answer_slot":
+        reply = _build_task_interrupt_reply(
+            message=latest_message,
+            history=history,
+            slots=slots_before,
+            current_slot=current_slot,
+            intent=intent,
+        )
+        _debug_log(
+            "task_text_controller_interrupt",
+            intent=intent,
+            current_slot=current_slot,
+            reply_preview=(reply or "")[:120],
+        )
+        return {
+            "reply": reply,
+            "buttons": [],
+            "source": "task_text_controller_interrupt",
+            "is_final": False,
+            "final_output": None,
+        }
+
+    slots_after = _task_free_text_slots_from_history(history, latest_message)
+    task_ready = _is_task_free_text_ready_from_slots(slots_after)
+    _debug_log(
+        "task_text_controller_answer",
+        current_slot=current_slot,
+        task_ready=task_ready,
+        slots=slots_after,
+    )
+
+    if task_ready:
+        final_output = _build_task_text_final_output_from_slots(slots_after)
+        if final_output:
+            return {
+                "reply": "我已根據你的需求整理出一個參考建議，請查看下方摘要。",
+                "buttons": [],
+                "source": "task_text_controller_final",
+                "is_final": True,
+                "final_output": final_output,
+            }
+
+    conversation_text = _conversation_text(history, latest_message)
+    reply = _next_task_free_text_question(conversation_text, latest_message, slots=slots_after)
+    return {
+        "reply": reply,
+        "buttons": [],
+        "source": "task_text_controller",
+        "is_final": False,
+        "final_output": None,
+    }
+
+
+def _current_task_slot_from_slots(slots):
+    slots = dict(slots or _empty_task_slots())
+    required_slot = _next_required_slot_for_slots(slots, _slots_to_normalized_text(slots))
+    if required_slot == "budget_adjustment":
+        return "tradeoff_priority"
+    return required_slot or "recommend"
+
+
+def _detect_task_interrupt_intent(message, current_slot, slots):
+    """Step 3: classify whether the latest user text is a slot answer or side branch.
+
+    This is intentionally bounded. It does not decide the next task slot and it
+    does not recommend a final service. It only prevents free-text questions from
+    being committed as slot values.
+    """
+    text = _normalize_task_free_text(message)
+    slots = dict(slots or _empty_task_slots())
+    if not text:
+        return {"type": "answer_slot", "reason": "empty_or_no_text"}
+
+    if current_slot == "recommend":
+        return {"type": "answer_slot", "reason": "already_ready"}
+
+    if _is_uncertain_reply_text(text):
+        if current_slot in {"budget_range", "tradeoff_priority", "perm_preference"}:
+            return {"type": "answer_slot", "reason": "uncertain_allowed_for_current_slot"}
+        return {"type": "uncertain", "reason": "user_uncertain"}
+
+    if _has_any_phrase(text, ("差異", "差別", "差在哪", "有什麼不同", "有甚麼不同", "不同在哪", "比較")):
+        return {"type": "ask_difference", "reason": "difference_question"}
+
+    if _has_any_phrase(text, ("什麼意思", "甚麼意思", "意思是", "不懂", "這是什麼", "這是甚麼")):
+        return {"type": "ask_meaning", "reason": "meaning_question"}
+
+    if _is_advice_or_choice_question(text):
+        return {"type": "ask_recommendation", "reason": "advice_or_choice_question"}
+
+    if _has_any_phrase(text, ("可以嗎", "可不可以", "能不能", "做得到", "做得到嗎", "需要嗎", "要不要", "一定要", "一定需要", "會不會")):
+        if _has_any_phrase(text, ("傷", "傷髮", "髮質", "受損", "壞", "斷", "毛躁", "乾")):
+            return {"type": "ask_risk", "reason": "risk_question"}
+        return {"type": "ask_feasibility", "reason": "feasibility_question"}
+
+    if _has_any_phrase(text, ("多少錢", "價錢", "價格", "價位", "預算", "貴", "便宜", "費用")):
+        # A pure numeric budget answer should remain a slot answer.
+        if current_slot == "budget_range" and _detect_budget_range(text):
+            return {"type": "answer_slot", "reason": "budget_answer"}
+        return {"type": "ask_price", "reason": "price_question"}
+
+    if "?" in text or "？" in text:
+        return {"type": "ask_question", "reason": "question_mark"}
+
+    return {"type": "answer_slot", "reason": "default"}
+
+
+def _build_task_interrupt_reply(message, history, slots, current_slot, intent):
+    slots = dict(slots or _empty_task_slots())
+    conversation_text = _conversation_text(history, message)
+    main_question = _next_task_free_text_question(conversation_text, message, slots=slots)
+    interrupt_type = (intent or {}).get("type")
+
+    branch_reply = ""
+    if interrupt_type == "uncertain":
+        branch_reply = _uncertain_explanation_for_current_slot(conversation_text, slots=slots)
+    elif interrupt_type == "ask_recommendation":
+        branch_reply = _advice_confirmation_reply_for_current_slot(slots, message)
+        if branch_reply:
+            return branch_reply
+        branch_reply = _task_followup_explanation(conversation_text, message, slots=slots)
+    elif interrupt_type in {"ask_difference", "ask_meaning", "ask_feasibility", "ask_risk", "ask_price", "ask_question"}:
+        branch_reply = _task_followup_explanation(conversation_text, message, slots=slots)
+        if not branch_reply:
+            branch_reply = _interrupt_fallback_explanation(current_slot, slots, interrupt_type)
+
+    if not branch_reply:
+        branch_reply = _interrupt_fallback_explanation(current_slot, slots, interrupt_type)
+
+    if main_question and main_question not in branch_reply and "這樣對嗎" not in branch_reply:
+        return f"{branch_reply}\n\n{main_question}"
+    return branch_reply or main_question
+
+
+def _interrupt_fallback_explanation(current_slot, slots, interrupt_type):
+    slots = dict(slots or _empty_task_slots())
+    direction = slots.get("direction")
+
+    if current_slot == "dye_detail":
+        return "全頭染是整體換色；補染主要是處理新生髮根或局部色差。"
+    if current_slot == "target_color":
+        return "自然深色偏低調，一般棕色偏日常換色，高明度特殊色通常更明顯，也可能需要更多前置處理。"
+    if current_slot == "current_base":
+        return "目前底色會影響染後顯色程度。自然黑髮通常較難直接變亮；染過或漂過會影響後續可行性。"
+    if current_slot == "bleach_accept":
+        return "是否需要漂髮會看目標色和目前底色。高明度、灰感、銀色、粉色或特殊色通常較可能需要漂髮。"
+    if current_slot == "brand_priority":
+        return "修護優先會偏向降低染後乾澀與毛躁；顏色表現與CP值優先會偏向顯色效率與預算平衡。"
+    if current_slot == "perm_detail":
+        return "整體燙髮是改變整體捲度；髮根燙主要改善頭頂扁塌；燙瀏海是局部調整瀏海線條。"
+    if current_slot == "perm_blocker":
+        return "這題是安全限制確認。漂過、懷孕或髮質嚴重受損都可能不適合直接燙髮。"
+    if current_slot == "perm_preference":
+        return "平衡預算偏向先完成基本燙髮造型；重視燙後髮質與修護感則偏向降低燙後髮況負擔。"
+    if current_slot == "treatment_detail":
+        return "受損修護偏向染燙後乾裂與分岔；柔順抗毛躁偏向改善打結、毛躁與觸感；日常保養偏向維持光澤。"
+    if current_slot == "budget_range":
+        return "預算會影響可推薦的服務範圍；如果不確定，也可以直接說不確定。"
+    if current_slot == "tradeoff_priority":
+        return "預算優先會傾向較保守的方案；效果優先會傾向更接近目標，但可能需要提高預算或接受更多處理。"
+
+    if direction:
+        return "我會先回答你的問題，再回到目前的服務選擇流程。"
+    return "我會先釐清你的問題，再回到主要服務選擇流程。"
 
 def _build_task_button_ready_response(history, message):
     effective_history = _history_with_latest_user_message(history, message)
@@ -412,6 +598,11 @@ def _get_mock_reply(input_mode, conversation_style, message, history, system_pro
 
 
 def _get_gemini_reply(input_mode, conversation_style, message, history, system_prompt):
+    # Task-led free-text should not enter the general Gemini reply path.
+    # It is handled by _get_task_text_controller_reply() at the public entry.
+    if input_mode == "text" and conversation_style == "task":
+        return _get_task_text_controller_reply(message, history)
+
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
         return _get_mock_reply(
@@ -476,6 +667,11 @@ def _get_gemini_reply(input_mode, conversation_style, message, history, system_p
 
 
 def _get_ollama_reply(input_mode, conversation_style, message, history, system_prompt):
+    # Task-led free-text should not enter the general Ollama reply path.
+    # It is handled by _get_task_text_controller_reply() at the public entry.
+    if input_mode == "text" and conversation_style == "task":
+        return _get_task_text_controller_reply(message, history)
+
     model = os.getenv("OLLAMA_MODEL", "gemma3:4b").strip()
     endpoint = os.getenv("OLLAMA_API_URL", "http://localhost:11434/api/chat").strip()
     resolved_endpoint = _resolve_ollama_endpoint(endpoint)
@@ -1074,6 +1270,19 @@ def _task_free_text_slots_from_history(history, message):
         if state.get("pending_confirmation") and _is_negative_reply_text(normalized_message):
             _debug_log("task_fsm_pending_rejected", pending=state.get("pending_confirmation"))
             state["pending_confirmation"] = None
+
+        current_slot = state.get("current_slot")
+        if current_slot == "budget_adjustment":
+            current_slot = "tradeoff_priority"
+        intent = _detect_task_interrupt_intent(normalized_message, current_slot, state.get("slots"))
+        if intent.get("type") != "answer_slot":
+            _debug_log(
+                "task_fsm_interrupt_skipped",
+                current_slot=current_slot,
+                intent=intent,
+                message=normalized_message,
+            )
+            continue
 
         _consume_latest_message_for_task_fsm(state, normalized_message)
         _advance_task_fsm_state(state)
