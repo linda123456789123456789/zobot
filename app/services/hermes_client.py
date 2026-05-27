@@ -1183,7 +1183,165 @@ def _normalize_pending_confirmation_value(slot_key, raw_value):
     return None
 
 
+def _extract_contextual_short_answer_for_slot(slot_key, normalized_message):
+    """Interpret short answers using the active FSM slot.
+
+    Step 5: the user often answers with "可以", "前者", "第二個",
+    or "都可以" because the assistant question already supplies the context.
+    This helper maps those short answers only for the current slot and never
+    fills unrelated slots.
+    """
+    text = _normalize_task_free_text(normalized_message)
+    compact = re.sub(r"\\s+", "", text.lower())
+    if not compact:
+        return None
+
+    first_tokens = ("前者", "第一個", "第1個", "1", "一", "選一", "選1", "第一項", "第一")
+    second_tokens = ("後者", "第二個", "第2個", "2", "二", "選二", "選2", "第二項", "第二")
+    third_tokens = ("第三個", "第3個", "3", "三", "選三", "選3", "第三項", "第三")
+    fourth_tokens = ("第四個", "第4個", "4", "四", "選四", "選4", "第四項", "第四", "最後一個")
+
+    def has_token(tokens):
+        return compact in tokens or any(token in compact for token in tokens if len(token) > 1)
+
+    if slot_key == "bleach_accept":
+        if _is_contextual_negative_answer(text):
+            return "希望不漂髮"
+        if _is_contextual_affirmative_answer(text):
+            return "可接受漂髮"
+
+    if slot_key == "dye_detail":
+        if has_token(first_tokens) or _has_any_phrase(text, ("整頭", "全頭", "全部", "整個", "整體", "換色", "重新染", "全染")):
+            return "全頭染"
+        if has_token(second_tokens) or _has_any_phrase(text, ("補染", "補髮根", "髮根", "布丁", "局部", "新生髮")):
+            return "補染"
+        if has_token(third_tokens) or _has_any_phrase(text, ("漂髮設計染", "漂染", "漂髮", "特殊色", "挑染", "耳圈")):
+            return "漂髮設計染"
+
+    if slot_key == "target_color":
+        if has_token(first_tokens):
+            return "自然深色"
+        if has_token(second_tokens):
+            return "一般棕色"
+        if has_token(third_tokens):
+            return "高明度特殊色"
+
+    if slot_key == "current_base":
+        if has_token(first_tokens):
+            return "自然黑髮"
+        if has_token(second_tokens):
+            return "已染深色/中深色"
+        if has_token(third_tokens):
+            return "已染淺色/已漂過"
+
+    if slot_key == "brand_priority":
+        if (
+            has_token(first_tokens)
+            or _has_any_phrase(text, ("修護", "髮質", "護髮", "毛躁", "乾燥", "受損", "柔順", "打結", "分岔", "分叉"))
+        ):
+            return "重視染後髮質修護"
+        if (
+            has_token(second_tokens)
+            or _has_any_phrase(text, ("顏色", "顯色", "cp", "cp值", "cp 值", "價格", "預算", "便宜", "划算", "效果"))
+        ):
+            return "重視顏色表現與CP值"
+        if _is_uncertain_reply_text(text) or _has_any_phrase(text, ("兩個都", "都重視", "都可以", "都想要")):
+            return "兩者都重視"
+
+    if slot_key == "tradeoff_priority":
+        if has_token(first_tokens) or _has_any_phrase(text, ("預算", "價格", "便宜", "省錢", "cp", "cp值", "cp 值")):
+            return "以預算為優先"
+        if has_token(second_tokens) or _has_any_phrase(text, ("效果", "顯色", "髮質", "修護", "護理")):
+            return "以效果為優先"
+        if _is_uncertain_reply_text(text):
+            return "我不確定"
+
+    if slot_key == "perm_detail":
+        if has_token(first_tokens) or _has_any_phrase(text, ("整體", "全頭", "燙捲", "整頭")):
+            return "整體燙髮"
+        if has_token(second_tokens) or _has_any_phrase(text, ("髮根", "頭頂", "蓬鬆")):
+            return "髮根燙"
+        if has_token(third_tokens) or _has_any_phrase(text, ("瀏海", "劉海")):
+            return "燙瀏海"
+
+    if slot_key == "perm_blocker":
+        if has_token(first_tokens) or _has_any_phrase(text, ("漂過", "有漂", "曾漂")):
+            return "曾經漂過頭髮"
+        if has_token(second_tokens) or _has_any_phrase(text, ("懷孕", "孕婦")):
+            return "目前懷孕"
+        if has_token(third_tokens) or _has_any_phrase(text, ("嚴重受損", "斷裂", "容易斷")):
+            return "髮質嚴重受損或容易斷裂"
+        if has_token(fourth_tokens) or _has_any_phrase(text, ("以上皆無", "都沒有", "沒有", "無")):
+            return "以上皆無"
+
+    if slot_key == "perm_preference":
+        if has_token(first_tokens) or _has_any_phrase(text, ("預算", "基本", "平衡", "便宜", "造型")):
+            return "平衡預算，完成基本燙髮造型"
+        if has_token(second_tokens) or _has_any_phrase(text, ("髮質", "柔順", "修護", "質感", "受損")):
+            return "重視燙後髮質、柔順度與修護感"
+        if _is_uncertain_reply_text(text):
+            return "不確定"
+
+    if slot_key == "treatment_detail":
+        if has_token(first_tokens) or _has_any_phrase(text, ("受損", "修護", "染燙", "乾裂", "分叉", "分岔")):
+            return "受損修護"
+        if has_token(second_tokens) or _has_any_phrase(text, ("柔順", "毛躁", "打結", "觸感", "服貼")):
+            return "柔順抗毛躁"
+        if has_token(third_tokens) or _has_any_phrase(text, ("日常", "保養", "入門", "光澤", "基礎")):
+            return "日常保養"
+
+    return None
+
+
+def _is_contextual_affirmative_answer(text):
+    normalized = _normalize_task_free_text(text)
+    compact = re.sub(r"\\s+", "", normalized.lower())
+    if _is_affirmative_reply_text(normalized):
+        return True
+    return compact in {
+        "可以接受",
+        "能接受",
+        "可接受",
+        "接受",
+        "可以",
+        "可",
+        "能",
+        "好",
+        "好啊",
+        "ok",
+        "okay",
+        "沒問題",
+        "行",
+        "可以的",
+        "願意",
+    }
+
+
+def _is_contextual_negative_answer(text):
+    normalized = _normalize_task_free_text(text)
+    compact = re.sub(r"\\s+", "", normalized.lower())
+    if _is_negative_reply_text(normalized):
+        return True
+    return compact in {
+        "不要",
+        "不想",
+        "不想要",
+        "不行",
+        "不能",
+        "不可以",
+        "不接受",
+        "不願意",
+        "先不要",
+        "還是不要",
+        "沒辦法",
+    }
+
+
 def _extract_value_for_current_task_slot(slot_key, normalized_message, current_slots):
+    contextual_value = _extract_contextual_short_answer_for_slot(slot_key, normalized_message)
+    if contextual_value is not None:
+        return contextual_value
+
     if slot_key == "direction":
         return _detect_direction(normalized_message)
 
@@ -1246,7 +1404,7 @@ def _extract_value_for_current_task_slot(slot_key, normalized_message, current_s
     if slot_key == "bleach_accept":
         if _has_any_phrase(normalized_message, ("不想漂", "不想要漂", "不要漂", "不漂", "不能漂", "不可以漂", "不接受漂")):
             return "希望不漂髮"
-        if _has_any_phrase(normalized_message, ("可以漂", "可漂", "接受漂", "能漂", "願意漂")):
+        if _has_any_phrase(normalized_message, ("可以漂", "可漂", "接受漂", "能漂", "願意漂", "可以接受漂")):
             return "可接受漂髮"
         return None
 
