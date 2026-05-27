@@ -1070,6 +1070,18 @@ def _consume_latest_message_for_task_fsm(state, normalized_message):
         state["slots"] = slots
         return
 
+    # Step 6: if the user is asking for advice / clarification rather than
+    # directly choosing an option, do not commit the inferred value yet.
+    # Let the reply explain the likely direction and ask for confirmation.
+    if _should_hold_inferred_answer_for_clarification(current_slot, normalized_message, value, slots):
+        state["slots"] = slots
+        _debug_log(
+            "task_fsm_inferred_answer_held",
+            current_slot=current_slot,
+            inferred_value=value,
+        )
+        return
+
     slots[current_slot] = value
     if current_slot == "direction":
         _clear_cross_direction_slots(slots)
@@ -1119,6 +1131,7 @@ def _pending_confirmation_from_assistant(assistant_text):
         (r"我先理解成你偏向(先平衡預算完成基本造型)，這樣對嗎", "perm_preference"),
         (r"我先理解成你這次偏好是「([^」]+)」，這樣對嗎", "brand_priority"),
         (r"我先理解成你想以「([^」]+)」為主，這樣對嗎", "tradeoff_priority"),
+        (r"我先理解成你這次想改善的是「([^」]+)」，這樣對嗎", "treatment_detail"),
     )
 
     for pattern, slot in patterns:
@@ -1335,6 +1348,99 @@ def _is_contextual_negative_answer(text):
         "還是不要",
         "沒辦法",
     }
+
+
+def _is_advice_or_choice_question(text):
+    normalized = _normalize_task_free_text(text)
+    return _has_any_phrase(
+        normalized,
+        (
+            "你會建議",
+            "會建議",
+            "建議我",
+            "你推薦",
+            "推薦我",
+            "哪個比較適合",
+            "哪個適合",
+            "選哪個",
+            "選哪一個",
+            "怎麼選",
+            "該選哪個",
+            "應該選哪個",
+            "幫我選",
+            "幫我判斷",
+        ),
+    )
+
+
+def _should_hold_inferred_answer_for_clarification(slot_key, normalized_message, inferred_value, current_slots):
+    """Return True when a value was inferred from a question, not chosen directly.
+
+    Step 6 separates clarification / advice seeking from direct slot answers.
+    Example: at brand_priority, "我的頭髮很毛躁，你會建議我選哪個" contains
+    evidence for 修護, but the user is asking the system to advise rather than
+    committing a preference. We explain and ask confirmation instead of
+    advancing to final immediately.
+    """
+    del current_slots
+    if not inferred_value:
+        return False
+    if slot_key not in {"brand_priority", "tradeoff_priority", "perm_preference", "treatment_detail"}:
+        return False
+    return _is_advice_or_choice_question(normalized_message)
+
+
+def _advice_confirmation_reply_for_current_slot(slots, user_message):
+    message = _normalize_task_free_text(user_message)
+    slots = dict(slots or _empty_task_slots())
+    direction = slots.get("direction")
+
+    if direction == "染髮" and not slots.get("brand_priority"):
+        suggested = _extract_value_for_current_task_slot("brand_priority", message, slots)
+        if suggested == "重視染後髮質修護":
+            return (
+                "如果你的頭髮偏毛躁、乾燥或受損，通常會比較建議優先看染後髮質修護，"
+                "因為這個方向會比較重視染後觸感與髮況負擔。\n\n"
+                "我先理解成你這次偏好是「重視染後髮質修護」，這樣對嗎？"
+            )
+        if suggested == "重視顏色表現與CP值":
+            return (
+                "如果你更在意顏色是否明顯、顯色效率或預算表現，通常會比較偏向顏色表現與CP值。\n\n"
+                "我先理解成你這次偏好是「重視顏色表現與CP值」，這樣對嗎？"
+            )
+        if suggested == "兩者都重視":
+            return (
+                "如果你兩邊都在意，我會先把它當成兩者都重視，再用後面的預算條件幫你收斂。\n\n"
+                "我先理解成你這次偏好是「兩者都重視」，這樣對嗎？"
+            )
+
+    if direction == "燙髮" and not slots.get("perm_preference"):
+        suggested = _extract_value_for_current_task_slot("perm_preference", message, slots)
+        if suggested == "重視燙後髮質、柔順度與修護感":
+            return (
+                "如果你在意毛躁、受損或燙後觸感，通常會比較建議優先看燙後髮質與修護感。\n\n"
+                "我先理解成你是重視燙後髮質與修護感，這樣對嗎？"
+            )
+        if suggested == "平衡預算，完成基本燙髮造型":
+            return (
+                "如果你主要想先完成基本造型並控制預算，通常會比較偏向平衡預算的方向。\n\n"
+                "我先理解成你偏向先平衡預算完成基本造型，這樣對嗎？"
+            )
+
+    if direction == "護髮" and not slots.get("treatment_detail"):
+        suggested = _extract_value_for_current_task_slot("treatment_detail", message, slots)
+        if suggested == "柔順抗毛躁":
+            return (
+                "如果你的主要困擾是毛躁、打結或不夠服貼，通常會比較建議先看柔順抗毛躁。\n\n"
+                "我先理解成你這次想改善的是「柔順抗毛躁」，這樣對嗎？"
+            )
+        if suggested == "受損修護":
+            return (
+                "如果你的主要困擾是染燙受損、乾裂或分岔，通常會比較建議先看受損修護。\n\n"
+                "我先理解成你這次想改善的是「受損修護」，這樣對嗎？"
+            )
+
+    return ""
 
 
 def _extract_value_for_current_task_slot(slot_key, normalized_message, current_slots):
@@ -1622,7 +1728,7 @@ def _is_followup_question(text):
     normalized = _normalize_task_free_text(text)
     return _has_any_phrase(
         normalized,
-        ("?", "？", "為什麼", "怎麼", "需要", "要不要", "可以嗎", "會不會", "風險", "差別", "差在哪", "什麼意思", "甚麼意思"),
+        ("?", "？", "為什麼", "怎麼", "需要", "要不要", "可以嗎", "會不會", "風險", "差別", "差在哪", "什麼意思", "甚麼意思", "建議", "推薦", "選哪個", "選哪一個", "哪個比較適合", "哪個適合", "該選哪個"),
     )
 
 
@@ -1637,7 +1743,14 @@ def _task_followup_explanation(conversation_text, user_message, slots=None):
                 return "整體燙髮是改變整體捲度；髮根燙主要增加頭頂蓬鬆；燙瀏海則是局部修飾臉型。"
         return ""
     if direction != "染髮":
+        advice_reply = _advice_confirmation_reply_for_current_slot(slots, message)
+        if advice_reply:
+            return advice_reply
         return ""
+
+    advice_reply = _advice_confirmation_reply_for_current_slot(slots, message)
+    if advice_reply:
+        return advice_reply
 
     if _has_any_phrase(message, ("差別", "差在哪", "不同", "比較")):
         return _difference_explanation_for_next_slot(conversation_text, slots=slots)
@@ -1719,6 +1832,8 @@ def _guard_task_reply_if_not_ready(reply, ready, input_mode, history, message):
                 ai_reply = ""
             base_reply = ai_reply or explanation
             if base_reply:
+                if "這樣對嗎" in base_reply:
+                    return base_reply
                 if next_question and next_question not in base_reply:
                     return f"{base_reply}\n\n{next_question}"
                 return base_reply
