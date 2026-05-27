@@ -1296,13 +1296,263 @@ def _extract_explicit_value_for_consecutive_slot(slot_key, normalized_message, c
 
 
 def _semantic_parse_current_slot(slot_key, user_message, current_slots):
-    """Bounded semantic fallback for the current FSM slot.
+    """Bounded AI semantic fallback for the current FSM slot.
 
-    Step 10 + Step 12:
-    - Input is limited to the current slot, latest user message, and current slots.
-    - Output is only one enum value from the slot schema plus confidence.
-    - It never advances flow, fills other slots, or recommends a service.
+    Step B:
+    - First try an actual AI classifier constrained by the current slot schema.
+    - AI may only choose one value from allowed_values, or return null.
+    - AI must not decide flow, fill other slots, or recommend services.
+    - If AI is unavailable, invalid, or low-confidence, fall back to the
+      previous rule-based semantic parser.
     """
+    if slot_key not in SEMANTIC_SLOT_SCHEMAS:
+        return _semantic_none("slot_not_supported")
+
+    text = _normalize_task_free_text(user_message)
+    if not text:
+        return _semantic_none("empty_message")
+
+    if _semantic_rejects_slot(slot_key, text):
+        return _semantic_none("rejected_by_slot_rule")
+
+    ai_result = _call_semantic_slot_ai_classifier(
+        slot_key=slot_key,
+        user_message=text,
+        current_slots=current_slots,
+    )
+    if ai_result.get("value") and ai_result.get("confidence") in {"high", "medium"}:
+        _debug_log(
+            "semantic_slot_ai_classifier_result",
+            slot_key=slot_key,
+            value=ai_result.get("value"),
+            confidence=ai_result.get("confidence"),
+            reason=ai_result.get("reason"),
+        )
+        return ai_result
+
+    rule_result = _rule_semantic_parse_current_slot(slot_key, text, current_slots)
+    if rule_result.get("value"):
+        _debug_log(
+            "semantic_slot_rule_fallback_result",
+            slot_key=slot_key,
+            value=rule_result.get("value"),
+            confidence=rule_result.get("confidence"),
+            reason=rule_result.get("reason"),
+            ai_reason=ai_result.get("reason"),
+        )
+        return rule_result
+
+    return ai_result if ai_result.get("reason") else _semantic_none("no_semantic_match")
+
+
+def _call_semantic_slot_ai_classifier(slot_key, user_message, current_slots):
+    """Call the configured AI provider as a bounded slot classifier.
+
+    This function is intentionally separate from the normal chatbot reply
+    generation path. It sends only the current slot schema, latest user message,
+    and already-filled slots. It does not send full history.
+    """
+    schema = SEMANTIC_SLOT_SCHEMAS.get(slot_key)
+    if not schema:
+        return _semantic_none("slot_not_supported")
+
+    provider = os.getenv("AI_PROVIDER", "mock").strip().lower()
+    if provider not in {"ollama", "gemini"}:
+        return _semantic_none("semantic_ai_provider_disabled")
+
+    prompt = _build_semantic_slot_classifier_prompt(
+        slot_key=slot_key,
+        user_message=user_message,
+        current_slots=current_slots,
+        schema=schema,
+    )
+
+    if provider == "ollama":
+        return _call_ollama_semantic_slot_classifier(prompt, schema)
+
+    if provider == "gemini":
+        return _call_gemini_semantic_slot_classifier(prompt, schema)
+
+    return _semantic_none("semantic_ai_provider_unsupported")
+
+
+def _build_semantic_slot_classifier_prompt(slot_key, user_message, current_slots, schema):
+    safe_slots = {}
+    if isinstance(current_slots, dict):
+        for key, value in current_slots.items():
+            if value:
+                safe_slots[key] = value
+
+    allowed_values = list(schema.get("allowed_values") or ())
+    examples = schema.get("examples") or {}
+
+    return (
+        "你是 ZOSS 美髮諮詢系統的 slot classifier。你的任務只是在目前 slot 的 allowed_values 中分類使用者最新一句話。\n"
+        "你不能決定下一題、不能補其他 slot、不能推薦服務、不能輸出自然語言。\n\n"
+        f"current_slot: {slot_key}\n"
+        f"slot_description: {schema.get('slot_description')}\n"
+        f"allowed_values: {json.dumps(allowed_values, ensure_ascii=False)}\n"
+        f"examples: {json.dumps(examples, ensure_ascii=False)}\n"
+        f"reject_rule: {schema.get('reject_rule')}\n"
+        f"already_filled_slots: {json.dumps(safe_slots, ensure_ascii=False)}\n"
+        f"user_message: {user_message}\n\n"
+        "輸出規則：\n"
+        "1. value 必須是 allowed_values 裡的其中一個字串，或 null。\n"
+        "2. confidence 只能是 high、medium、low、none。\n"
+        "3. 如果使用者訊息明確對應某一類，confidence=high。\n"
+        "4. 如果需要推論但合理，confidence=medium。\n"
+        "5. 如果訊息屬於其他 slot、資訊不足、或違反 reject_rule，value=null 且 confidence=none。\n"
+        "6. reason 用一句繁體中文說明分類依據，不要超過 40 字。\n"
+        "7. 只輸出 JSON，不要 markdown，不要額外文字。\n\n"
+        "JSON 格式：\n"
+        "{\"value\": null, \"confidence\": \"none\", \"reason\": \"\"}"
+    )
+
+
+def _call_ollama_semantic_slot_classifier(prompt, schema):
+    model = os.getenv("OLLAMA_MODEL", "gemma3:4b").strip()
+    endpoint = os.getenv("OLLAMA_API_URL", "http://localhost:11434/api/chat").strip()
+    resolved_endpoint = _resolve_ollama_endpoint(endpoint)
+    use_openai_compat = _is_openai_compat_endpoint(endpoint)
+
+    if use_openai_compat:
+        payload = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "你只能輸出 JSON。不要輸出任何解釋、markdown 或多餘文字。",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "stream": False,
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+        }
+    else:
+        payload = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "你只能輸出 JSON。不要輸出任何解釋、markdown 或多餘文字。",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "format": "json",
+            "stream": False,
+            "options": {"temperature": 0},
+        }
+
+    request = urllib.request.Request(
+        resolved_endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            response_data = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+        _debug_log("semantic_ollama_request_failed", error=str(error)[:160])
+        return _semantic_none("semantic_ollama_request_failed")
+
+    raw_text = _extract_ollama_text(response_data)
+    parsed = _parse_model_json(raw_text)
+    return _normalize_semantic_ai_result(parsed, schema, raw_text)
+
+
+def _call_gemini_semantic_slot_classifier(prompt, schema):
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return _semantic_none("semantic_gemini_api_key_missing")
+
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite").strip()
+    endpoint = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model}:generateContent"
+    )
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0,
+            "response_mime_type": "application/json",
+        },
+    }
+
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": api_key,
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            response_data = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+        _debug_log("semantic_gemini_request_failed", error=str(error)[:160])
+        return _semantic_none("semantic_gemini_request_failed")
+
+    raw_text = _extract_gemini_text(response_data)
+    parsed = _parse_model_json(raw_text)
+    return _normalize_semantic_ai_result(parsed, schema, raw_text)
+
+
+def _normalize_semantic_ai_result(parsed, schema, raw_text=""):
+    if not isinstance(parsed, dict):
+        _debug_log("semantic_ai_json_parse_failed", raw_preview=str(raw_text or "")[:180])
+        return _semantic_none("semantic_ai_json_parse_failed")
+
+    allowed_values = set(schema.get("allowed_values") or ())
+    raw_value = parsed.get("value")
+    value = str(raw_value).strip() if raw_value is not None else None
+    if value in {"", "null", "None", "none"}:
+        value = None
+
+    confidence = str(parsed.get("confidence") or "none").strip().lower()
+    if confidence not in {"high", "medium", "low", "none"}:
+        confidence = "none"
+
+    reason = str(parsed.get("reason") or "").strip()
+
+    if value and value not in allowed_values:
+        normalized_value = _normalize_semantic_ai_value(value, allowed_values)
+        if normalized_value:
+            value = normalized_value
+        else:
+            return _semantic_none("semantic_ai_value_not_allowed")
+
+    if not value:
+        return {"value": None, "confidence": "none", "reason": reason or "semantic_ai_no_value"}
+
+    if confidence in {"low", "none"}:
+        return {"value": None, "confidence": confidence, "reason": reason or "semantic_ai_low_confidence"}
+
+    return {"value": value, "confidence": confidence, "reason": reason}
+
+
+def _normalize_semantic_ai_value(value, allowed_values):
+    normalized = _normalize_task_free_text(value)
+    for allowed in allowed_values:
+        if normalized == _normalize_task_free_text(allowed):
+            return allowed
+
+    # Handle common partial outputs while still keeping the value bounded.
+    for allowed in allowed_values:
+        allowed_norm = _normalize_task_free_text(allowed)
+        if normalized and (normalized in allowed_norm or allowed_norm in normalized):
+            return allowed
+
+    return None
+
+
+def _rule_semantic_parse_current_slot(slot_key, user_message, current_slots):
+    """Previous rule-based semantic parser used as a safe fallback."""
     del current_slots
     if slot_key not in SEMANTIC_SLOT_SCHEMAS:
         return _semantic_none("slot_not_supported")
