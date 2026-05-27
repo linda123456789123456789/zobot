@@ -13,6 +13,28 @@ from app.services.service_catalog import RECOMMENDATION_RULES, SERVICE_CATEGORIE
 MAX_BUTTON_OPTIONS = 5
 UNCERTAIN_BUTTON_LABEL = "我不確定"
 BUDGET_NO_PREFERENCE = "預算不確定"
+BUDGET_NO_PREFERENCE_PHRASES = (
+    "預算不確定",
+    "價位不確定",
+    "預算我不確定",
+    "我不確定預算",
+    "預算都可以",
+    "價位都可以",
+    "預算可彈性",
+    "預算都可",
+    "價位都可",
+    "預算可以",
+    "沒有預算限制",
+    "沒有預算偏好",
+    "沒預算限制",
+    "預算不限",
+    "沒有價位限制",
+    "沒有價位偏好",
+    "沒價位限制",
+    "價位不限",
+    "我預算都可以",
+    "我價位都可以",
+)
 TEMPLATE_REPLY_PATTERNS = (
     "自然、簡潔的下一句回覆",
     "自然, 簡潔的下一句回覆",
@@ -274,6 +296,15 @@ def get_chatbot_reply(input_mode, conversation_style, message, history, system_p
 
     if provider == "ollama":
         return _get_ollama_reply(
+            input_mode=input_mode,
+            conversation_style=conversation_style,
+            message=message,
+            history=history,
+            system_prompt=system_prompt,
+        )
+
+    if provider == "openai":
+        return _get_openai_reply(
             input_mode=input_mode,
             conversation_style=conversation_style,
             message=message,
@@ -666,6 +697,68 @@ def _get_gemini_reply(input_mode, conversation_style, message, history, system_p
     )
 
 
+def _get_openai_reply(input_mode, conversation_style, message, history, system_prompt):
+    # Task-led free-text should not enter the general OpenAI reply path.
+    # It is handled by _get_task_text_controller_reply() at the public entry.
+    if input_mode == "text" and conversation_style == "task":
+        return _get_task_text_controller_reply(message, history)
+
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return _get_mock_reply(
+            input_mode=input_mode,
+            conversation_style=conversation_style,
+            message=message,
+            history=history,
+            system_prompt=system_prompt,
+        )
+
+    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
+    endpoint = _resolve_openai_chat_completions_endpoint(os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip())
+    prompt = build_model_instruction(
+        input_mode,
+        conversation_style,
+        system_prompt,
+        history=history,
+    )
+    payload = {
+        "model": model,
+        "messages": _build_ollama_messages(prompt, message, history),
+        "stream": False,
+        "temperature": 0.4,
+        "response_format": {"type": "json_object"},
+    }
+
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=_openai_headers(api_key),
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            response_data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError:
+        return _ai_error_reply("目前 OpenAI API 回覆失敗，請確認 API key、模型與額度。")
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return _ai_error_reply("目前 OpenAI 連線不穩，請稍後再試。")
+
+    text = _extract_ollama_text(response_data)
+    parsed = _parse_model_json(text)
+    if not parsed:
+        return _ai_error_reply("OpenAI 回覆格式暫時無法解析，請再試一次。")
+
+    model_response = _normalize_model_result(parsed, input_mode, source="openai")
+    return _force_final_at_turn_limit(
+        model_response,
+        input_mode=input_mode,
+        conversation_style=conversation_style,
+        message=message,
+        history=history,
+    )
+
+
 def _get_ollama_reply(input_mode, conversation_style, message, history, system_prompt):
     # Task-led free-text should not enter the general Ollama reply path.
     # It is handled by _get_task_text_controller_reply() at the public entry.
@@ -857,6 +950,25 @@ def _resolve_ollama_endpoint(endpoint):
     if normalized.lower().endswith("/v1"):
         return normalized.rstrip("/") + "/chat/completions"
     return normalized
+
+
+def _resolve_openai_chat_completions_endpoint(base_url):
+    normalized = str(base_url or "").strip()
+    if not normalized:
+        return "https://api.openai.com/v1/chat/completions"
+    if normalized.lower().endswith("/chat/completions"):
+        return normalized
+    if normalized.lower().endswith("/v1"):
+        return normalized.rstrip("/") + "/chat/completions"
+    return normalized.rstrip("/") + "/chat/completions"
+
+
+def _openai_headers(api_key):
+    headers = {"Content-Type": "application/json"}
+    key = str(api_key or "").strip()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    return headers
 
 
 def _parse_model_json(text):
@@ -1521,6 +1633,11 @@ def _semantic_parse_current_slot(slot_key, user_message, current_slots):
     if not text:
         return _semantic_none("empty_message")
 
+    # Global guard: clarification/advice-style questions should not commit slots.
+    # They are handled by interrupt explanation + explicit follow-up answer.
+    if _is_clarification_message(text):
+        return _semantic_none("clarification_question_no_commit")
+
     if _semantic_rejects_slot(slot_key, text):
         return _semantic_none("rejected_by_slot_rule")
 
@@ -1566,7 +1683,7 @@ def _call_semantic_slot_ai_classifier(slot_key, user_message, current_slots):
         return _semantic_none("slot_not_supported")
 
     provider = os.getenv("AI_PROVIDER", "mock").strip().lower()
-    if provider not in {"ollama", "gemini"}:
+    if provider not in {"ollama", "gemini", "openai"}:
         return _semantic_none("semantic_ai_provider_disabled")
 
     prompt = _build_semantic_slot_classifier_prompt(
@@ -1581,6 +1698,9 @@ def _call_semantic_slot_ai_classifier(slot_key, user_message, current_slots):
 
     if provider == "gemini":
         return _call_gemini_semantic_slot_classifier(prompt, schema)
+
+    if provider == "openai":
+        return _call_openai_semantic_slot_classifier(prompt, schema)
 
     return _semantic_none("semantic_ai_provider_unsupported")
 
@@ -1712,6 +1832,46 @@ def _call_gemini_semantic_slot_classifier(prompt, schema):
     return _normalize_semantic_ai_result(parsed, schema, raw_text)
 
 
+def _call_openai_semantic_slot_classifier(prompt, schema):
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return _semantic_none("semantic_openai_api_key_missing")
+
+    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
+    endpoint = _resolve_openai_chat_completions_endpoint(os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip())
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "你只能輸出 JSON。不要輸出任何解釋、markdown 或多餘文字。",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "stream": False,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+    }
+
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=_openai_headers(api_key),
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            response_data = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+        _debug_log("semantic_openai_request_failed", error=str(error)[:160])
+        return _semantic_none("semantic_openai_request_failed")
+
+    raw_text = _extract_ollama_text(response_data)
+    parsed = _parse_model_json(raw_text)
+    return _normalize_semantic_ai_result(parsed, schema, raw_text)
+
+
 def _normalize_semantic_ai_result(parsed, schema, raw_text=""):
     if not isinstance(parsed, dict):
         _debug_log("semantic_ai_json_parse_failed", raw_preview=str(raw_text or "")[:180])
@@ -1816,6 +1976,12 @@ def _semantic_rejects_slot(slot_key, text):
         return _has_any_phrase(text, ("目前", "現在", "原本", "底色", "退成", "之前", "染過", "漂過"))
 
     if slot_key == "current_base":
+        # Prevent color-category questions (e.g. "銀色算哪一類") from being
+        # misread as current base answers.
+        if _semantic_color_only_text(compact):
+            return True
+        if _has_any_phrase(text, ("哪一類", "哪種類型", "屬於哪種", "算哪種", "算哪一類")):
+            return True
         return _has_any_phrase(text, ("想染", "想要染", "染成", "希望染", "目標", "想變成", "我要染"))
 
     if slot_key == "bleach_accept":
@@ -2199,6 +2365,17 @@ def _is_advice_or_choice_question(text):
     )
 
 
+def _is_clarification_message(text):
+    normalized = _normalize_task_free_text(text)
+    if not normalized:
+        return False
+    return (
+        _is_followup_question(normalized)
+        or _is_difference_question(normalized)
+        or _is_advice_or_choice_question(normalized)
+    )
+
+
 def _should_hold_inferred_answer_for_clarification(slot_key, normalized_message, inferred_value, current_slots):
     """Return True when a value was inferred from a question, not chosen directly.
 
@@ -2524,6 +2701,10 @@ def _has_budget_info(text):
     return re.search(r"\d{3,5}", text) is not None
 
 
+def _is_budget_no_preference_text(text):
+    return _has_any_phrase(text, BUDGET_NO_PREFERENCE_PHRASES)
+
+
 def _has_any_phrase(text, phrases):
     lowered = (text or "").lower()
     return any((phrase or "").lower() in lowered for phrase in phrases)
@@ -2592,6 +2773,11 @@ def _is_followup_question(text):
             "選哪個",
             "選哪一個",
             "選哪種",
+            "哪一類",
+            "哪種類型",
+            "屬於哪種",
+            "算哪種",
+            "算哪一類",
             "哪個比較適合",
             "哪個適合",
             "該選哪個",
@@ -2618,6 +2804,16 @@ def _task_followup_explanation(conversation_text, user_message, slots=None):
     advice_reply = _advice_confirmation_reply_for_current_slot(slots, message)
     if advice_reply:
         return advice_reply
+
+    if _has_any_phrase(message, ("哪一類", "哪種類型", "屬於哪種", "算哪種", "算哪一類")):
+        color_hint = _extract_target_color_hint(message)
+        if color_hint:
+            if color_hint in {"銀色", "銀", "灰色", "灰", "粉色", "粉紅", "藍色", "藍", "紫色", "紫", "橘色", "橘", "紅色", "紅", "金色", "金"}:
+                return f"{color_hint}通常會歸在高明度特殊色。"
+            if color_hint in {"棕色", "棕", "咖啡色", "咖啡"}:
+                return f"{color_hint}通常會歸在一般棕色。"
+            if color_hint in {"黑色", "黑"}:
+                return f"{color_hint}通常會歸在自然深色。"
 
     if _has_any_phrase(message, ("差別", "差在哪", "不同", "比較")):
         return _difference_explanation_for_next_slot(conversation_text, slots=slots)
@@ -3119,14 +3315,25 @@ def _bridge_cross_domain_preference_for_perm(merged_slots, rule_slots, normalize
 
 def _extract_task_slots_with_llm(normalized_text):
     provider = os.getenv("AI_PROVIDER", "mock").strip().lower()
-    if provider != "ollama":
+    if provider not in {"ollama", "openai"}:
         _debug_log("slot_extract_llm_skipped", provider=provider)
         return None
 
-    model = os.getenv("OLLAMA_MODEL", "gemma3:4b").strip()
-    endpoint = os.getenv("OLLAMA_API_URL", "http://localhost:11434/api/chat").strip()
-    resolved_endpoint = _resolve_ollama_endpoint(endpoint)
-    use_openai_compat = _is_openai_compat_endpoint(endpoint)
+    if provider == "openai":
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            _debug_log("slot_extract_openai_api_key_missing")
+            return None
+        model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
+        resolved_endpoint = _resolve_openai_chat_completions_endpoint(os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip())
+        use_openai_compat = True
+        request_headers = _openai_headers(api_key)
+    else:
+        model = os.getenv("OLLAMA_MODEL", "gemma3:4b").strip()
+        endpoint = os.getenv("OLLAMA_API_URL", "http://localhost:11434/api/chat").strip()
+        resolved_endpoint = _resolve_ollama_endpoint(endpoint)
+        use_openai_compat = _is_openai_compat_endpoint(endpoint)
+        request_headers = {"Content-Type": "application/json"}
     schema_text = (
         "direction: 染髮|燙髮|護髮|null\n"
         "dye_detail: 全頭染|補染|漂髮設計染|null\n"
@@ -3175,7 +3382,7 @@ def _extract_task_slots_with_llm(normalized_text):
     request = urllib.request.Request(
         resolved_endpoint,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=request_headers,
         method="POST",
     )
 
@@ -3270,21 +3477,7 @@ def _detect_budget_range(text):
     if not _has_budget_info(text):
         return None
 
-    if _has_any_phrase(
-        text,
-        (
-            "預算不確定",
-            "價位不確定",
-            "預算我不確定",
-            "我不確定預算",
-            "預算都可以",
-            "價位都可以",
-            "預算可彈性",
-            "預算都可",
-            "價位都可",
-            "預算可以",
-        ),
-    ):
+    if _is_budget_no_preference_text(text):
         return BUDGET_NO_PREFERENCE
 
     if _has_any_phrase(text, ("1200以下", "1200 以下", "千二以下")):
@@ -3637,21 +3830,7 @@ def _budget_value_supported_by_user_text(value, normalized_text):
     if not value:
         return False
     if value == BUDGET_NO_PREFERENCE:
-        return _has_any_phrase(
-            normalized_text,
-            (
-                "預算不確定",
-                "價位不確定",
-                "預算我不確定",
-                "我不確定預算",
-                "預算都可以",
-                "價位都可以",
-                "預算可彈性",
-                "預算都可",
-                "價位都可",
-                "預算可以",
-            ),
-        )
+        return _is_budget_no_preference_text(normalized_text)
     detected = _detect_budget_range(normalized_text)
     if detected == value:
         return True
@@ -3764,21 +3943,7 @@ def _is_budget_no_preference_value(budget_range, normalized_text=""):
     token = str(budget_range or "").strip()
     if token in {BUDGET_NO_PREFERENCE, UNCERTAIN_BUTTON_LABEL, "不確定"}:
         return True
-    return _has_any_phrase(
-        normalized_text,
-        (
-            "預算不確定",
-            "價位不確定",
-            "預算我不確定",
-            "我不確定預算",
-            "預算都可以",
-            "價位都可以",
-            "預算可彈性",
-            "預算都可",
-            "價位都可",
-            "預算可以",
-        ),
-    )
+    return _is_budget_no_preference_text(normalized_text)
 
 
 def _candidate_services_for_task_slots(slots):

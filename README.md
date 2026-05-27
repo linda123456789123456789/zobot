@@ -109,10 +109,15 @@ ZOSS Chatbot Prototype 是一個 Flask MVC 風格的本機研究原型，用來�
 FLASK_ENV=development
 SECRET_KEY=replace-this-with-a-local-secret
 
-# mock 或 gemini
+# mock / gemini / ollama / openai
 AI_PROVIDER=mock
 GEMINI_API_KEY=
 GEMINI_MODEL=gemini-2.5-flash-lite
+OLLAMA_API_URL=http://localhost:11434/api/chat
+OLLAMA_MODEL=gemma3:4b
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-4.1-mini
+OPENAI_BASE_URL=https://api.openai.com/v1
 
 # Reserved for future Hermes Agent API integration.
 HERMES_API_URL=
@@ -123,6 +128,10 @@ HERMES_AGENT_ID=
 `AI_PROVIDER=mock` 時會使用 `app/services/hermes_client.py` 內的本機規則回覆，不需要外部 API。
 
 `AI_PROVIDER=gemini` 時，後端會呼叫 Gemini API。若 `GEMINI_API_KEY` 未設定，系統會 fallback 到 mock 回覆。
+
+`AI_PROVIDER=ollama` 時，後端會呼叫本機 Ollama。
+
+`AI_PROVIDER=openai` 時，後端會呼叫 OpenAI Chat Completions API，需設定 `OPENAI_API_KEY`。
 
 請不要把真實 API key 放進版本控制；真實金鑰應只存在本機 `.env` 或部署環境變數中。
 
