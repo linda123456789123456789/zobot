@@ -1,621 +1,441 @@
-import re
+"""Task-led and topic-led flow controller for ZOSS.
 
-from app.services.service_catalog import SERVICE_CATEGORIES
-
+Design principle:
+- task-led/button and task-led/free-text share the same slot schema.
+- button_flow owns deterministic flow control: current slots -> next missing slot -> prompt.
+- AI/free-text parsing may fill slots, but it must not own the main flow.
+"""
 
 UNCERTAIN = "我不確定"
-UNCERTAIN_ALIASES = {UNCERTAIN, "不確定"}
-BUDGET_KEYWORD = "預算範圍"
-DEFAULT_BUDGET_RANGE_OPTIONS = ["1200 以下", "1201-1800", "1801-2400", "2401 以上", UNCERTAIN]
-BUDGET_RANGE_LABELS = ("1200 以下", "1201-1800", "1801-2400", "2401 以上")
-COLOR_TARGET_OPTIONS = ["自然深色", "一般棕色", "高明度特殊色", UNCERTAIN]
-CURRENT_BASE_OPTIONS = ["自然黑髮", "已染深色/中深色", "已染淺色/已漂過", UNCERTAIN]
-BLEACH_PREFERENCE_OPTIONS = ["可接受漂髮", "希望不漂髮", UNCERTAIN]
-COLOR_BRAND_PRIORITY_OPTIONS = ["重視染後髮質修護", "重視顏色表現與CP值", UNCERTAIN]
-TRADEOFF_PRIORITY_OPTIONS = ["以預算為優先", "以效果為優先", UNCERTAIN]
-DYE_AREA_CLARIFY_OPTIONS = ["是，主要在頭皮三公分內", "不是，超過三公分或接近全頭", UNCERTAIN]
-PERM_BLOCKER_OPTIONS = ["曾經漂過頭髮", "目前懷孕", "髮質嚴重受損或容易斷裂", "以上皆無"]
-PERM_PREFERENCE_UNCERTAIN = "不確定，請用預算判斷"
-PERM_OVERALL_PREFERENCE_OPTIONS = [
-    "平衡預算，完成基本燙髮造型",
-    "重視燙後髮質、柔順度與修護感",
-    PERM_PREFERENCE_UNCERTAIN,
-]
+UNCERTAIN_ALIASES = {UNCERTAIN, "不確定", "不知道", "還不確定", "不清楚"}
 
-TASK_LED_STEPS = [
-    {
+BUDGET_RANGES = ("1200 以下", "1201-1800", "1801-2400", "2401 以上", "預算不確定")
+
+TASK_SLOT_ENUMS = {
+    "direction": ("染髮", "燙髮", "護髮"),
+    "goal": ("改變髮色", "改變髮型", "改善髮質"),
+    "dye_detail": ("全頭染", "補染", "漂髮設計染"),
+    "dye_root_range": ("是，主要在頭皮三公分內", "不是，超過三公分或接近全頭"),
+    "target_color": ("自然深色", "一般棕色", "高明度特殊色"),
+    "current_base": ("自然黑髮", "已染深色/中深色", "已染淺色/已漂過"),
+    "bleach_accept": ("可接受漂髮", "希望不漂髮"),
+    "brand_priority": ("重視染後髮質修護", "重視顏色表現與CP值", "兩者都重視"),
+    "tradeoff_priority": ("以預算為優先", "以效果為優先"),
+    "perm_detail": ("整體燙髮", "髮根燙", "燙瀏海"),
+    "perm_blocker": ("曾經漂過頭髮", "目前懷孕", "髮質嚴重受損或容易斷裂", "以上皆無"),
+    "perm_preference": ("平衡預算，完成基本燙髮造型", "重視燙後髮質、柔順度與修護感"),
+    "treatment_detail": ("受損修護", "柔順抗毛躁", "日常保養"),
+    "budget_range": BUDGET_RANGES,
+}
+
+TASK_SLOT_ORDER = (
+    "direction",
+    "dye_detail",
+    "dye_root_range",
+    "target_color",
+    "current_base",
+    "bleach_accept",
+    "brand_priority",
+    "tradeoff_priority",
+    "perm_detail",
+    "perm_blocker",
+    "perm_preference",
+    "treatment_detail",
+    "budget_range",
+)
+
+TASK_PROMPTS = {
+    "direction": {
         "question": "請選擇你這次想預約的美髮服務方向。",
         "buttons": ["染髮", "護髮", "燙髮"],
     },
-    {
-        "question": "如果還不確定，請選擇最接近你的目標。",
-        "buttons": ["改變髮色", "改變髮型", "改善髮質", UNCERTAIN],
+    "goal": {
+        "question": "如果還不確定服務類型，請選擇最接近你的目標。",
+        "buttons": ["改變髮色", "改變髮型", "改善髮質"],
     },
-    {
-        "question": "請選擇服務細項。",
-        "buttons": ["全頭染", "補染", UNCERTAIN],
+    "dye_detail": {
+        "question": "請選擇你想做的染髮類型。",
+        "buttons": ["全頭染", "補染", "漂髮設計染"],
     },
-    {
-        "question": "請選擇最重要的必要條件。",
-        "buttons": ["預算範圍", "時間限制", "髮況限制", UNCERTAIN],
+    "dye_detail_easy": {
+        "question": "你目前比較接近哪一種情況？",
+        "buttons": ["整頭換色", "只補新長出的髮根", "想做特殊色或局部設計"],
     },
-]
+    "dye_root_range": {
+        "question": "你想補染的範圍主要在頭皮三公分內嗎？",
+        "buttons": ["是，主要在頭皮三公分內", "不是，超過三公分或接近全頭"],
+    },
+    "target_color": {
+        "question": "請選擇你想要的染後顏色方向。",
+        "buttons": ["自然深色", "一般棕色", "高明度特殊色"],
+    },
+    "target_color_easy": {
+        "question": "如果不確定色系，請選擇你想要的變化程度。",
+        "buttons": ["低調自然", "明顯變淺或特殊色"],
+    },
+    "current_base": {
+        "question": "請選擇你目前的髮色底色。",
+        "buttons": ["自然黑髮", "已染深色/中深色", "已染淺色/已漂過"],
+    },
+    "current_base_easy": {
+        "question": "你目前頭髮比較接近哪一種狀態？",
+        "buttons": ["沒染過或自然黑", "有染過但偏深", "有漂過或目前偏淺"],
+    },
+    "bleach_accept": {
+        "question": "依你的目標色，可能需要漂髮。你可接受漂髮嗎？",
+        "buttons": ["可接受漂髮", "希望不漂髮"],
+    },
+    "brand_priority": {
+        "question": "你這次更重視哪一點？",
+        "buttons": ["重視染後髮質修護", "重視顏色表現與CP值", "兩者都重視"],
+    },
+    "tradeoff_priority": {
+        "question": "如果目標效果與預算無法同時滿足，你會優先考量哪一點？",
+        "buttons": ["以預算為優先", "以效果為優先"],
+    },
+    "perm_detail": {
+        "question": "請選擇你想做的燙髮類型。",
+        "buttons": ["整體燙髮", "髮根燙", "燙瀏海"],
+    },
+    "perm_detail_easy": {
+        "question": "你比較想改善哪一個造型問題？",
+        "buttons": ["想整體有捲度", "頭頂想更蓬鬆", "只想整理瀏海"],
+    },
+    "perm_blocker": {
+        "question": "請選擇是否有以下不適合燙髮的狀況。",
+        "buttons": ["曾經漂過頭髮", "目前懷孕", "髮質嚴重受損或容易斷裂", "以上皆無"],
+    },
+    "perm_preference": {
+        "question": "整體燙髮時，你比較重視哪一點？",
+        "buttons": ["平衡預算，完成基本燙髮造型", "重視燙後髮質、柔順度與修護感"],
+    },
+    "treatment_detail": {
+        "question": "請選擇你目前最想改善的髮絲狀況。",
+        "buttons": ["受損修護", "柔順抗毛躁", "日常保養"],
+    },
+    "treatment_detail_easy": {
+        "question": "如果不確定護髮類型，請選擇最接近的髮況。",
+        "buttons": ["染燙後偏乾受損", "毛躁打結不柔順", "想做一般保養"],
+    },
+    "budget_range": {
+        "question": "請選擇你的預算價位範圍。",
+        "buttons": list(BUDGET_RANGES),
+    },
+}
 
 TOPIC_LED_STEPS = [
-    {
-        "question": "你想先從哪個方向了解？",
-        "buttons": ["染燙護差異", "依照髮況選擇", UNCERTAIN],
-    },
-    {
-        "question": "如果依照你剛剛的方向來看，你比較在意哪一點？",
-        "buttons": ["服務效果", "適合的髮況", UNCERTAIN],
-    },
-    {
-        "question": "目前你比較偏向哪一種需求？",
-        "buttons": ["想改變造型", "想修護髮況", UNCERTAIN],
-    },
+    {"question": "你想先從哪個方向了解？", "buttons": ["染燙護差異", "依照髮況選擇", UNCERTAIN]},
+    {"question": "目前你比較在意哪一點？", "buttons": ["服務效果", "適合的髮況", UNCERTAIN]},
+    {"question": "目前你比較偏向哪一種需求？", "buttons": ["想改變造型", "想修護髮況", UNCERTAIN]},
 ]
+
+BUTTON_ALIASES = {
+    "改變髮色": ("direction", "染髮"),
+    "改變髮型": ("direction", "燙髮"),
+    "改善髮質": ("direction", "護髮"),
+    "整頭換色": ("dye_detail", "全頭染"),
+    "只補新長出的髮根": ("dye_detail", "補染"),
+    "想做特殊色或局部設計": ("dye_detail", "漂髮設計染"),
+    "不是，超過三公分或接近全頭": ("dye_detail", "全頭染"),
+    "低調自然": ("target_color", "自然深色"),
+    "明顯變淺或特殊色": ("target_color", "高明度特殊色"),
+    "沒染過或自然黑": ("current_base", "自然黑髮"),
+    "有染過但偏深": ("current_base", "已染深色/中深色"),
+    "有漂過或目前偏淺": ("current_base", "已染淺色/已漂過"),
+    "想整體有捲度": ("perm_detail", "整體燙髮"),
+    "頭頂想更蓬鬆": ("perm_detail", "髮根燙"),
+    "只想整理瀏海": ("perm_detail", "燙瀏海"),
+    "染燙後偏乾受損": ("treatment_detail", "受損修護"),
+    "毛躁打結不柔順": ("treatment_detail", "柔順抗毛躁"),
+    "想做一般保養": ("treatment_detail", "日常保養"),
+}
 
 
 def get_initial_question(input_mode, conversation_style):
     if input_mode == "button":
-        return _steps_for(conversation_style)[0]["question"]
-
+        if conversation_style == "task":
+            return TASK_PROMPTS["direction"]["question"]
+        return TOPIC_LED_STEPS[0]["question"]
     if conversation_style == "task":
         return "你好，我是 ZOBOT。接下來我會一步一步了解你的髮況與需求，協助你整理適合的染髮、燙髮或護髮方向。請先告訴我，你這次主要想改善什麼？"
-
     return "你好，我是 ZOBOT。你可以先從最近的髮況、想了解的染燙護問題，或對服務的疑問開始聊，我會根據你的描述提供建議。"
 
 
 def get_button_options(input_mode, conversation_style, history=None, is_final=False):
     if input_mode != "button" or is_final:
         return []
-
     if conversation_style == "task":
-        guided = get_task_guided_prompt(history)
-        if guided:
-            return guided["buttons"]
-
+        prompt = get_task_guided_prompt(history)
+        return prompt["buttons"] if prompt else []
     step = _current_step_index(history)
-    steps = _steps_for(conversation_style)
-    if step >= len(steps):
-        return []
-
-    return steps[step]["buttons"]
+    return TOPIC_LED_STEPS[step]["buttons"] if step < len(TOPIC_LED_STEPS) else []
 
 
 def get_next_question(input_mode, conversation_style, history):
     if input_mode != "button":
         return None
-
     if conversation_style == "task":
-        guided = get_task_guided_prompt(history)
-        if guided:
-            return guided["question"]
-
+        prompt = get_task_guided_prompt(history)
+        return prompt["question"] if prompt else None
     step = _current_step_index(history)
-    steps = _steps_for(conversation_style)
-    if step >= len(steps):
-        return None
-
-    return steps[step]["question"]
+    return TOPIC_LED_STEPS[step]["question"] if step < len(TOPIC_LED_STEPS) else None
 
 
 def get_task_guided_prompt(history):
-    user_messages = _user_messages(history)
-    turn = len(user_messages)
-
-    # Q1 is rendered from initial UI state.
-    if turn <= 0:
-        return {
-            "question": "請選擇你這次想預約的美髮服務方向。",
-            "buttons": ["染髮", "護髮", "燙髮"],
-        }
-
-    direction = _resolve_direction(user_messages)
-    if not direction:
-        return {
-            "question": "請先選擇最接近你的目標。",
-            "buttons": ["改變髮色", "改變髮型", "改善髮質", UNCERTAIN],
-        }
-
-    if _needs_budget_range_followup(user_messages):
-        budget_options = _budget_range_options_for(direction, user_messages)
-        if _has_multiple_budget_options(budget_options):
-            return {
-                "question": "請選擇你的預算價位範圍。",
-                "buttons": budget_options,
-            }
-
-    if turn == 1:
-        if _is_uncertain(user_messages[0]):
-            return {
-                "question": "請選擇最接近你的情況。",
-                "buttons": ["改變髮色", "改變髮型", "改善髮質", UNCERTAIN],
-            }
-        return _detail_question_for_direction(direction)
-
-    return _next_missing_slot_prompt(direction, user_messages)
+    slots = extract_task_slots_from_history(history)
+    key = next_prompt_key(slots)
+    if not key:
+        return None
+    prompt = dict(TASK_PROMPTS[key])
+    prompt["slot"] = canonical_prompt_slot(key)
+    prompt["buttons"] = _with_uncertain(prompt["buttons"])
+    return prompt
 
 
-def _detail_question_for_direction(direction):
+def extract_task_slots_from_history(history, latest_user_message=None):
+    slots = {}
+    current_slot = None
+    for message in _messages(history):
+        role = str(message.get("role") or "").lower()
+        content = str(message.get("content") or message.get("message") or "")
+        if role in {"assistant", "bot", "ai"}:
+            current_slot = infer_slot_from_question(content) or current_slot
+        elif role == "user":
+            _merge_answer_into_slots(slots, content, current_slot)
+    if latest_user_message is not None:
+        _merge_answer_into_slots(slots, str(latest_user_message), current_slot)
+    normalize_dependent_slots(slots)
+    return slots
+
+
+def merge_slots(base_slots, new_slots):
+    merged = dict(base_slots or {})
+    for key, value in (new_slots or {}).items():
+        if value is None or value == "":
+            continue
+        if key in TASK_SLOT_ENUMS and value not in TASK_SLOT_ENUMS[key] and value != UNCERTAIN:
+            continue
+        merged[key] = value
+    normalize_dependent_slots(merged)
+    return merged
+
+
+def normalize_dependent_slots(slots):
+    goal = slots.get("goal")
+    if goal == "改變髮色":
+        slots.setdefault("direction", "染髮")
+    elif goal == "改變髮型":
+        slots.setdefault("direction", "燙髮")
+    elif goal == "改善髮質":
+        slots.setdefault("direction", "護髮")
+
+    if slots.get("dye_root_range") == "不是，超過三公分或接近全頭":
+        slots["dye_detail"] = "全頭染"
+
+    detail = slots.get("dye_detail")
+    if detail in {"補染", "漂髮設計染"}:
+        for key in ("target_color", "bleach_accept", "brand_priority", "tradeoff_priority"):
+            slots.pop(key, None)
+
+    direction = slots.get("direction")
     if direction == "染髮":
-        return {"question": "請選擇你想做的染髮類型。", "buttons": ["全頭染", "補染", UNCERTAIN]}
+        for key in ("perm_detail", "perm_blocker", "perm_preference", "treatment_detail"):
+            slots.pop(key, None)
+    elif direction == "燙髮":
+        for key in ("dye_detail", "dye_root_range", "target_color", "current_base", "bleach_accept", "brand_priority", "tradeoff_priority", "treatment_detail"):
+            slots.pop(key, None)
+    elif direction == "護髮":
+        for key in ("dye_detail", "dye_root_range", "target_color", "current_base", "bleach_accept", "brand_priority", "tradeoff_priority", "perm_detail", "perm_blocker", "perm_preference"):
+            slots.pop(key, None)
+    return slots
+
+
+def next_prompt_key(slots):
+    direction = slots.get("direction")
+    if not direction or _is_uncertain(direction):
+        return "goal" if _is_uncertain(direction) else "direction"
+
+    if direction == "染髮":
+        return _next_dye_prompt_key(slots)
     if direction == "燙髮":
-        return {"question": "請選擇你想做的燙髮類型。", "buttons": ["整體燙髮", "髮根燙", "燙瀏海", UNCERTAIN]}
+        return _next_perm_prompt_key(slots)
     if direction == "護髮":
-        return {"question": "請選擇你目前最想改善的髮絲狀況。", "buttons": ["受損修護", "柔順抗毛躁", "日常保養", UNCERTAIN]}
-    if direction == "補染":
-        return {"question": "請確認你想做的服務細項。", "buttons": ["髮根補染", "全頭換色", UNCERTAIN]}
-    if direction == "漂髮":
-        return {"question": "請確認你想做的漂髮方向。", "buttons": ["一般漂髮", "特殊色設計染", UNCERTAIN]}
-    return {"question": "請選擇你想做的服務細項。", "buttons": ["染髮", "燙髮", "護髮", UNCERTAIN]}
+        return _next_treatment_prompt_key(slots)
+    return "direction"
 
 
-def _next_missing_slot_prompt(direction, user_messages):
-    if direction == "燙髮":
-        detail = _resolve_detail(direction, user_messages)
-        if not detail:
-            return _detail_question_for_direction(direction)
+def is_task_ready(slots):
+    return next_prompt_key(slots) is None
 
-        blocker = _resolve_perm_blocker(user_messages)
-        if not blocker:
-            return {"question": "是否有不可燙條件？", "buttons": PERM_BLOCKER_OPTIONS}
-        if blocker != "以上皆無":
-            return None
 
-        # Q3/Q4 only apply for overall perming.
-        if detail != "整體燙髮":
-            return None
+def canonical_prompt_slot(prompt_key):
+    return {
+        "goal": "direction",
+        "dye_detail_easy": "dye_detail",
+        "target_color_easy": "target_color",
+        "current_base_easy": "current_base",
+        "perm_detail_easy": "perm_detail",
+        "treatment_detail_easy": "treatment_detail",
+    }.get(prompt_key, prompt_key)
 
-        preference = _resolve_perm_overall_preference(user_messages)
-        if not preference:
-            return {
-                "question": "若是整體燙髮，請確認服務取向。",
-                "buttons": PERM_OVERALL_PREFERENCE_OPTIONS,
-            }
 
-        if preference == "重視燙後髮質、柔順度與修護感":
-            return None
-
-        if preference == "平衡預算，完成基本燙髮造型":
-            return None
-
-        if not _has_budget_range(user_messages):
-            budget_options = _budget_range_options_for(direction, user_messages)
-            if _has_multiple_budget_options(budget_options):
-                return {
-                    "question": "若不確定，請用預算範圍協助判斷。",
-                    "buttons": budget_options,
-                }
-        return None
-
-    if direction in {"染髮", "補染", "漂髮"}:
-        detail = _resolve_detail(direction, user_messages)
-        if not detail:
-            if _should_ask_dye_area_clarification(direction, user_messages):
-                return {
-                    "question": "你想染的範圍主要在頭皮三公分內嗎？",
-                    "buttons": DYE_AREA_CLARIFY_OPTIONS,
-                }
-            return _detail_question_for_direction(direction)
-
-        if detail == "補染":
-            return None
-
-        # 全頭染才需要追問顏色、底色與是否可漂。
-        if detail == "全頭染":
-            if not _has_any_non_uncertain(user_messages, COLOR_TARGET_OPTIONS):
-                return {"question": "請選擇你想要的染後顏色。", "buttons": COLOR_TARGET_OPTIONS}
-            if not _has_any_non_uncertain(user_messages, CURRENT_BASE_OPTIONS):
-                return {"question": "請選擇你目前的髮色底色。", "buttons": CURRENT_BASE_OPTIONS}
-            if _likely_need_bleach(user_messages) and not _has_any_non_uncertain(user_messages, BLEACH_PREFERENCE_OPTIONS):
-                return {
-                    "question": "依你提供的色系與底色，可能需要漂髮，你可接受嗎？",
-                    "buttons": BLEACH_PREFERENCE_OPTIONS,
-                }
-            if _likely_need_bleach(user_messages) and _pick_first(user_messages, set(BLEACH_PREFERENCE_OPTIONS)) == "可接受漂髮":
-                return None
-            if not _has_any_non_uncertain(user_messages, COLOR_BRAND_PRIORITY_OPTIONS):
-                return {
-                    "question": "你這次更重視哪一點？",
-                    "buttons": COLOR_BRAND_PRIORITY_OPTIONS,
-                }
-
-        if not _has_budget_range(user_messages):
-            budget_options = _budget_range_options_for(direction, user_messages)
-            if _has_multiple_budget_options(budget_options):
-                return {"question": "請選擇你的預算價位範圍。", "buttons": budget_options}
-        if _needs_priority_followup(direction, user_messages):
-            return {
-                "question": "看起來預算與效果偏好有取捨，你想優先哪一個？",
-                "buttons": TRADEOFF_PRIORITY_OPTIONS,
-            }
-        return None
-
-    if direction == "護髮":
-        if not _resolve_detail(direction, user_messages):
-            return _detail_question_for_direction(direction)
-        if not _has_budget_range(user_messages):
-            budget_options = _budget_range_options_for(direction, user_messages)
-            if _has_multiple_budget_options(budget_options):
-                return {"question": "請選擇你的預算價位範圍。", "buttons": budget_options}
-        if _needs_priority_followup(direction, user_messages):
-            return {
-                "question": "看起來預算與效果偏好有取捨，你想優先哪一個？",
-                "buttons": TRADEOFF_PRIORITY_OPTIONS,
-            }
-        return None
-
-    if not _has_budget_range(user_messages):
-        budget_options = _budget_range_options_for(direction, user_messages)
-        if _has_multiple_budget_options(budget_options):
-            return {"question": "請選擇你的預算價位範圍。", "buttons": budget_options}
+def infer_slot_from_question(question):
+    text = str(question or "")
+    checks = [
+        ("direction", ("服務方向", "服務類型", "想預約", "主要想改善")),
+        ("goal", ("最接近你的目標", "還不確定服務")),
+        ("dye_detail", ("染髮類型", "哪一種情況")),
+        ("dye_root_range", ("三公分", "補染的範圍")),
+        ("target_color", ("染後顏色", "色系", "變化程度")),
+        ("current_base", ("目前的髮色", "目前頭髮", "底色")),
+        ("bleach_accept", ("接受漂髮", "可接受漂髮")),
+        ("brand_priority", ("更重視哪一點", "染後髮質", "顏色表現")),
+        ("tradeoff_priority", ("優先考量", "預算無法同時")),
+        ("perm_detail", ("燙髮類型", "造型問題")),
+        ("perm_blocker", ("不適合燙髮", "是否有以下")),
+        ("perm_preference", ("整體燙髮時", "比較重視哪一點")),
+        ("treatment_detail", ("髮絲狀況", "護髮類型", "最接近的髮況")),
+        ("budget_range", ("預算價位", "預算範圍")),
+    ]
+    for slot, keywords in checks:
+        if any(keyword in text for keyword in keywords):
+            return slot
     return None
 
 
-def _has_priority_choice_answer(user_messages):
-    return _has_any(user_messages, set(TRADEOFF_PRIORITY_OPTIONS))
+def _next_dye_prompt_key(slots):
+    detail = slots.get("dye_detail")
+    if not detail:
+        return "dye_detail"
+    if _is_uncertain(detail):
+        return "dye_detail_easy"
+
+    if detail == "補染":
+        if not slots.get("dye_root_range"):
+            return "dye_root_range"
+        return None
+
+    if detail == "漂髮設計染":
+        if not slots.get("current_base"):
+            return "current_base"
+        if _is_uncertain(slots.get("current_base")):
+            return "current_base_easy"
+        if not slots.get("budget_range"):
+            return "budget_range"
+        return None
+
+    if detail == "全頭染":
+        if not slots.get("target_color"):
+            return "target_color"
+        if _is_uncertain(slots.get("target_color")):
+            return "target_color_easy"
+        if not slots.get("current_base"):
+            return "current_base"
+        if _is_uncertain(slots.get("current_base")):
+            return "current_base_easy"
+        if _likely_need_bleach(slots) and not slots.get("bleach_accept"):
+            return "bleach_accept"
+        if _likely_need_bleach(slots) and slots.get("bleach_accept") == "可接受漂髮":
+            return "budget_range" if not slots.get("budget_range") else None
+        if _likely_need_bleach(slots) and slots.get("bleach_accept") == "希望不漂髮":
+            if not slots.get("tradeoff_priority"):
+                return "tradeoff_priority"
+        if not slots.get("brand_priority"):
+            return "brand_priority"
+        return None
+    return "dye_detail"
 
 
-def _service_price_bounds():
-    bounds = {}
-    for category in SERVICE_CATEGORIES:
-        for service in category.get("services", []):
-            name = service.get("name")
-            price_text = str(service.get("price") or "")
-            if not name:
-                continue
-            numbers = [int(token) for token in re.findall(r"\d{3,5}", price_text.replace(",", ""))]
-            if not numbers:
-                bounds[name] = {"min": 0, "max": 999999}
-                continue
-            bounds[name] = {"min": min(numbers), "max": max(numbers)}
-    return bounds
-
-
-SERVICE_PRICE_BOUNDS = _service_price_bounds()
-
-
-def _budget_constraint_from_label(label):
-    token = str(label or "").strip()
-    if token == "1200 以下":
-        return {"min": None, "max": 1200}
-    if token == "1201-1800":
-        return {"min": 1201, "max": 1800}
-    if token == "1801-2400":
-        return {"min": 1801, "max": 2400}
-    if token == "2401 以上":
-        return {"min": 2401, "max": None}
+def _next_perm_prompt_key(slots):
+    if not slots.get("perm_detail"):
+        return "perm_detail"
+    if _is_uncertain(slots.get("perm_detail")):
+        return "perm_detail_easy"
+    if not slots.get("perm_blocker"):
+        return "perm_blocker"
+    if slots.get("perm_blocker") != "以上皆無":
+        return None
+    if slots.get("perm_detail") == "整體燙髮" and not slots.get("perm_preference"):
+        return "perm_preference"
     return None
 
 
-def _service_price_overlaps_budget(service_bounds, budget_constraint):
-    service_min = service_bounds.get("min")
-    service_max = service_bounds.get("max")
-    if service_min is None or service_max is None:
-        return False
-
-    budget_min = budget_constraint.get("min")
-    budget_max = budget_constraint.get("max")
-
-    if budget_min is not None and service_max < budget_min:
-        return False
-    if budget_max is not None and service_min > budget_max:
-        return False
-    return True
+def _next_treatment_prompt_key(slots):
+    if not slots.get("treatment_detail"):
+        return "treatment_detail"
+    if _is_uncertain(slots.get("treatment_detail")):
+        return "treatment_detail_easy"
+    return None
 
 
-def _service_matches_budget(service_name, budget_label):
-    constraint = _budget_constraint_from_label(budget_label)
-    if not constraint:
-        return False
-    bounds = SERVICE_PRICE_BOUNDS.get(service_name)
-    if not bounds:
-        return False
-    return _service_price_overlaps_budget(bounds, constraint)
-
-
-def _service_names_by_category_index(index):
-    if index < 0 or index >= len(SERVICE_CATEGORIES):
-        return []
-    return [service.get("name") for service in SERVICE_CATEGORIES[index].get("services", []) if service.get("name")]
-
-
-def _candidate_services_for_direction(direction, user_messages):
-    if direction in {"染髮", "補染", "漂髮"}:
-        dye_services = _service_names_by_category_index(0)
-        if len(dye_services) < 4:
-            return dye_services
-
-        detail = _resolve_detail(direction, user_messages)
-        if detail == "補染":
-            return [dye_services[2]]
-        bleach_accept = _pick_first(user_messages, set(BLEACH_PREFERENCE_OPTIONS))
-        brand_priority = _pick_first(user_messages, set(COLOR_BRAND_PRIORITY_OPTIONS))
-        if detail == "全頭染" and _likely_need_bleach(user_messages) and bleach_accept == "可接受漂髮":
-            return [dye_services[3]]
-
-        candidates = []
-        if brand_priority == "重視染後髮質修護":
-            candidates.extend([dye_services[1], dye_services[0]])
-        elif brand_priority == "重視顏色表現與CP值":
-            candidates.extend([dye_services[0], dye_services[1]])
+def _merge_answer_into_slots(slots, answer, current_slot=None):
+    text = str(answer or "").strip()
+    if not text:
+        return
+    if _is_uncertain(text):
+        if current_slot:
+            slots[canonical_prompt_slot(current_slot)] = UNCERTAIN
         else:
-            candidates.extend([dye_services[0], dye_services[1]])
+            slots.setdefault("direction", UNCERTAIN)
+        return
 
-        deduped = []
-        for item in candidates:
-            if item and item not in deduped:
-                deduped.append(item)
-        return deduped
+    if text in BUTTON_ALIASES:
+        slot, value = BUTTON_ALIASES[text]
+        slots[slot] = value
+        return
 
-    if direction == "燙髮":
-        perm_services = _service_names_by_category_index(1)
-        if len(perm_services) < 4:
-            return perm_services
+    for slot, values in TASK_SLOT_ENUMS.items():
+        if text in values:
+            slots[slot] = text
+            return
 
-        detail = _resolve_detail(direction, user_messages)
-        blocker = _resolve_perm_blocker(user_messages)
-        if blocker and blocker != "以上皆無":
-            return []
+    # tolerate compact budget strings produced by free-text/parser.
+    compact = text.replace(" ", "")
+    for item in BUDGET_RANGES:
+        if compact == item.replace(" ", ""):
+            slots["budget_range"] = item
+            return
 
-        if detail == "髮根燙":
-            return [perm_services[2]]
-        if detail == "燙瀏海":
-            return [perm_services[3]]
-
-        preference = _resolve_perm_overall_preference(user_messages)
-        if preference == "平衡預算，完成基本燙髮造型":
-            return [perm_services[0], perm_services[1]]
-        if preference == "重視燙後髮質、柔順度與修護感":
-            return [perm_services[1], perm_services[0]]
-        if preference == PERM_PREFERENCE_UNCERTAIN:
-            return [perm_services[0], perm_services[1]]
-        return [perm_services[0], perm_services[1]]
-
-    if direction == "護髮":
-        treatment_services = _service_names_by_category_index(2)
-        if len(treatment_services) < 3:
-            return treatment_services
-
-        detail = _resolve_detail(direction, user_messages)
-        if detail == "受損修護":
-            return [treatment_services[0], treatment_services[1], treatment_services[2]]
-        if detail == "柔順抗毛躁":
-            return [treatment_services[1], treatment_services[0], treatment_services[2]]
-        if detail == "日常保養":
-            return [treatment_services[2], treatment_services[1], treatment_services[0]]
-        return [treatment_services[1], treatment_services[0], treatment_services[2]]
-
-    return []
+    # Last-resort exact direction keywords.
+    if "染" in text and "燙" not in text and "護" not in text:
+        slots.setdefault("direction", "染髮")
+    elif "燙" in text:
+        slots.setdefault("direction", "燙髮")
+    elif "護" in text or "修護" in text or "保養" in text:
+        slots.setdefault("direction", "護髮")
 
 
-def _needs_priority_followup(direction, user_messages):
-    if _has_priority_choice_answer(user_messages):
-        return False
-    budget_label = _pick_first(user_messages, set(DEFAULT_BUDGET_RANGE_OPTIONS))
-    if not budget_label:
-        return False
-
-    ranked = _candidate_services_for_direction(direction, user_messages)
-    if len(ranked) < 2:
-        return False
-
-    filtered = [service_name for service_name in ranked if _service_matches_budget(service_name, budget_label)]
-    if not filtered:
-        return False
-
-    return ranked[0] != filtered[0]
+def _likely_need_bleach(slots):
+    return slots.get("target_color") == "高明度特殊色" or slots.get("current_base") == "已染深色/中深色"
 
 
-def _needs_budget_range_followup(user_messages):
-    selected_budget_keyword = any((msg or "").strip() == BUDGET_KEYWORD for msg in user_messages)
-    if not selected_budget_keyword:
-        return False
-
-    return not any(_is_budget_range_answer(msg) for msg in user_messages)
+def _is_uncertain(value):
+    return str(value or "").strip() in UNCERTAIN_ALIASES
 
 
-def _is_budget_range_answer(text):
-    label = (text or "").strip()
-    if not label:
-        return False
-    if label in DEFAULT_BUDGET_RANGE_OPTIONS:
-        return True
-    return re.search(r"\d{3,5}", label) is not None
+def _with_uncertain(buttons):
+    result = []
+    for button in buttons:
+        if button not in result:
+            result.append(button)
+    if UNCERTAIN not in result:
+        result.append(UNCERTAIN)
+    return result
 
 
-def _has_budget_range(user_messages):
-    return any(_is_budget_range_answer(msg) for msg in user_messages)
-
-
-def _has_multiple_budget_options(options):
-    actionable = [option for option in (options or []) if option != UNCERTAIN]
-    return len(actionable) > 1
-
-
-def _has_any(user_messages, candidates):
-    normalized = {(msg or "").strip() for msg in user_messages}
-    return any(candidate in normalized for candidate in candidates)
-
-
-def _has_any_non_uncertain(user_messages, candidates):
-    normalized_candidates = [option for option in (candidates or []) if option not in UNCERTAIN_ALIASES]
-    return _has_any(user_messages, set(normalized_candidates))
-
-
-def _budget_range_options_for(direction, user_messages):
-    ranked_candidates = _candidate_services_for_direction(direction, user_messages)
-    dynamic_options = _budget_range_options_from_candidates(ranked_candidates)
-    if dynamic_options:
-        return dynamic_options + [UNCERTAIN]
-
-    detail = _resolve_detail(direction, user_messages)
-
-    if direction == "燙髮":
-        if detail == "整體燙髮":
-            return ["1201-1800", "1801-2400", "2401 以上", UNCERTAIN]
-        if detail == "髮根燙":
-            return ["1201-1800", UNCERTAIN]
-        if detail == "燙瀏海":
-            return ["1200 以下", UNCERTAIN]
-        return ["1200 以下", "1201-1800", "1801-2400", "2401 以上", UNCERTAIN]
-
-    if direction in {"染髮", "補染", "漂髮"}:
-        if detail == "全頭染":
-            return ["1201-1800", "1801-2400", "2401 以上", UNCERTAIN]
-        if detail == "補染":
-            return ["1200 以下", "1201-1800", UNCERTAIN]
-        return ["1200 以下", "1201-1800", "1801-2400", "2401 以上", UNCERTAIN]
-
-    if direction == "護髮":
-        if detail == "受損修護":
-            return ["1201-1800", UNCERTAIN]
-        return ["1200 以下", "1201-1800", UNCERTAIN]
-
-    return DEFAULT_BUDGET_RANGE_OPTIONS
-
-
-def _budget_range_options_from_candidates(ranked_candidates):
-    if not ranked_candidates:
+def _messages(history):
+    if not history:
         return []
-
-    options = []
-    previous_signature = None
-    for budget_label in BUDGET_RANGE_LABELS:
-        filtered = [service_name for service_name in ranked_candidates if _service_matches_budget(service_name, budget_label)]
-        if not filtered:
-            continue
-
-        # Keep only ranges that actually change the remaining candidate set.
-        signature = tuple(filtered)
-        if signature == previous_signature:
-            continue
-
-        options.append(budget_label)
-        previous_signature = signature
-
-    return options
-
-
-def _resolve_detail(direction, user_messages):
-    labels = {(msg or "").strip() for msg in user_messages}
-
-    if direction == "燙髮":
-        for option in ("整體燙髮", "髮根燙", "燙瀏海"):
-            if option in labels:
-                return option
-        return None
-
-    if direction in {"染髮", "補染", "漂髮"}:
-        for option in ("全頭染", "補染"):
-            if option in labels:
-                return option
-        if "是，主要在頭皮三公分內" in labels:
-            return "補染"
-        if "不是，超過三公分或接近全頭" in labels:
-            return "全頭染"
-        if "漂髮設計染" in labels:
-            return "全頭染"
-        return None
-
-    if direction == "護髮":
-        for option in ("受損修護", "柔順抗毛躁", "日常保養"):
-            if option in labels:
-                return option
-        return None
-
-    return None
-
-
-def _resolve_perm_blocker(user_messages):
-    labels = {(msg or "").strip() for msg in user_messages}
-    for option in PERM_BLOCKER_OPTIONS:
-        if option in labels:
-            return option
-    return None
-
-
-def _resolve_perm_overall_preference(user_messages):
-    labels = {(msg or "").strip() for msg in user_messages}
-    for option in PERM_OVERALL_PREFERENCE_OPTIONS:
-        if option in labels:
-            return option
-    return None
-
-
-def _likely_need_bleach(user_messages):
-    target = _pick_first(user_messages, set(COLOR_TARGET_OPTIONS))
-    current = _pick_first(user_messages, set(CURRENT_BASE_OPTIONS))
-
-    if not target or not current:
-        return False
-
-    if target == "高明度特殊色":
-        return True
-    if target == "一般棕色" and current == "自然黑髮":
-        return True
-    return False
-
-
-def _should_ask_dye_area_clarification(direction, user_messages):
-    if direction not in {"染髮", "補染", "漂髮"}:
-        return False
-    if not user_messages:
-        return False
-    last_answer = (user_messages[-1] or "").strip()
-    return last_answer in UNCERTAIN_ALIASES
-
-
-def _pick_first(user_messages, candidates):
-    for msg in user_messages:
-        label = (msg or "").strip()
-        if label in candidates:
-            return label
-    return None
-
-
-def _resolve_direction(user_messages):
-    if not user_messages:
-        return None
-
-    first = user_messages[0]
-    direct_map = {"染髮", "補染", "漂髮", "燙髮", "護髮"}
-    if first in direct_map:
-        return first
-
-    if _is_uncertain(first) and len(user_messages) >= 2:
-        classifier = user_messages[1]
-        if classifier == "改變髮色":
-            return "染髮"
-        if classifier == "改變髮型":
-            return "燙髮"
-        if classifier == "改善髮質":
-            return "護髮"
-    return None
-
-
-def _is_uncertain(text):
-    return (text or "").strip() in UNCERTAIN_ALIASES
-
-
-def _steps_for(conversation_style):
-    if conversation_style == "topic":
-        return TOPIC_LED_STEPS
-
-    return TASK_LED_STEPS
+    if isinstance(history, dict):
+        history = history.get("messages", [])
+    result = []
+    for item in history or []:
+        if isinstance(item, dict):
+            result.append(item)
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            result.append({"role": item[0], "content": item[1]})
+    return result
 
 
 def _current_step_index(history):
-    if not isinstance(history, list):
-        return 0
-
-    user_turn_count = sum(1 for item in history if item.get("role") == "user")
-    return max(user_turn_count, 0)
-
-
-def _user_messages(history):
-    if not isinstance(history, list):
-        return []
-    return [(item.get("content") or "").strip() for item in history if item.get("role") == "user" and (item.get("content") or "").strip()]
+    return len([m for m in _messages(history) if str(m.get("role", "")).lower() == "user"])
